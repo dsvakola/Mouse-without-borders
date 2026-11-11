@@ -1,0 +1,83 @@
+:root {
+  --bg: #f0f0f0;
+  --panel: #ffffff;
+  --line: #d0d0d0;
+  --text: #1a1a1a;
+  --muted: #5f5f5f;
+  --accent: #0067c0;
+  --error: #b3261e;
+  color-scheme: light;
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); user-select: none; }
+#app { display: flex; flex-direction: column; height: 100%; padding: 8px 10px 10px; gap: 0; }
+
+.topbar { display: flex; justify-content: space-between; align-items: flex-end; }
+.tabs { display: flex; gap: 2px; }
+.tab {
+  font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-bottom: none;
+  background: #e6e6e6; color: var(--text); border-radius: 4px 4px 0 0; cursor: default;
+}
+.tab.active { background: var(--panel); position: relative; top: 1px; padding-bottom: 6px; }
+.link { font: inherit; background: none; border: none; color: var(--accent); text-decoration: underline; cursor: pointer; padding: 2px 4px; }
+
+main { flex: 1; min-height: 0; background: var(--panel); border: 1px solid var(--line); padding: 10px; overflow: hidden; }
+.panel { display: flex; flex-direction: column; gap: 8px; height: 100%; }
+.panel[hidden] { display: none; }
+
+fieldset { border: 1px solid var(--line); border-radius: 4px; margin: 0; padding: 6px 10px 8px; min-width: 0; }
+fieldset.grow { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+legend { padding: 0 4px; color: var(--text); }
+.row { margin: 3px 0; }
+.indent { margin-left: 20px; }
+label { cursor: default; }
+input[type="radio"], input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: -2px; accent-color: var(--accent); }
+.key-row { display: flex; align-items: center; gap: 8px; }
+.key-row input[type="password"], .key-row input[type="text"] {
+  font: inherit; flex: 1; padding: 4px 6px; border: 1px solid #8a8a8a; border-radius: 3px; background: #fff; user-select: text;
+}
+.inline { white-space: nowrap; }
+.hint { margin: 4px 0 0; color: var(--muted); }
+
+.matrix { flex: 1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; min-height: 0; margin-top: 6px; }
+.cell { border: 1px dashed #c4c4c4; border-radius: 6px; display: flex; align-items: center; justify-content: center; min-height: 0; }
+.cell.target { background: #e8f2fc; border-color: var(--accent); }
+.thumb { text-align: center; padding: 4px 8px; border-radius: 6px; cursor: grab; outline: none; touch-action: none; max-width: 100%; }
+.thumb:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.thumb .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+.thumb .sub { color: var(--muted); }
+.thumb.off .name, .thumb.off .sub { color: #8a8a8a; }
+.thumb.dragging { opacity: 0.35; }
+.thumb.ghost { position: fixed; z-index: 10; pointer-events: none; background: #fff; box-shadow: 0 4px 14px rgb(0 0 0 / 0.25); opacity: 0.95; }
+.two-row { margin-top: 6px; }
+.secondary-card { margin: 10px 0; padding: 14px; background: #f6f9fd; border: 1px solid #cfe0f3; border-radius: 6px; }
+
+.keys { border-collapse: collapse; width: 100%; }
+.keys td { padding: 4px 6px; border-bottom: 1px solid #eee; }
+.keys td:first-child { white-space: nowrap; font-weight: 600; width: 130px; }
+
+footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 10px; }
+.status { color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status.error { color: var(--error); }
+.buttons { display: flex; gap: 8px; }
+button { font: inherit; }
+.buttons button, dialog form button {
+  min-width: 76px; padding: 5px 14px; border: 1px solid #adadad; border-radius: 4px; background: #fdfdfd; color: var(--text); cursor: default;
+}
+.buttons button:hover { background: #f1f1f1; }
+button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.buttons button.primary:hover { background: #005aa8; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+dialog { border: 1px solid var(--line); border-radius: 8px; padding: 18px 26px; text-align: center; width: 340px; background: var(--panel); color: var(--text); }
+dialog::backdrop { background: rgb(0 0 0 / 0.3); }
+dialog h1 { font-size: 16px; margin: 8px 0 2px; }
+dialog p { margin: 6px 0; user-select: text; }
+dialog img { image-rendering: auto; }
+.muted { color: var(--muted); }
+
+[hidden] { display: none !important; }
+.matrix.two .thumb svg { width: 46px; height: 38px; }

@@ -1,0 +1,20 @@
+[package]
+name = "mouse-without-borders"
+version = "0.1.2"
+description = "Share one mouse and keyboard between up to three PCs"
+authors = ["Prof. Dattaraj S. Vidyasagar", "Prof. Yash D. Vidyasagar"]
+license = "GPL-3.0-only"
+edition = "2021"
+
+[lib]
+name = "mwb_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+mwb-core = { path = "../core" }

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mouse without borders</title>
+  </head>
+  <body>
+    <div id="app">
+      <div class="topbar">
+        <div class="tabs" role="tablist">
+          <button class="tab active" role="tab" data-tab="setup">Machine Setup</button>
+          <button class="tab" role="tab" data-tab="options">Other Options</button>
+          <button class="tab" role="tab" data-tab="ip">IP Mapping</button>
+        </div>
+        <button class="link" id="about-link">About</button>
+      </div>
+
+      <main>
+        <section class="panel" id="panel-setup">
+          <fieldset>
+            <legend>This computer</legend>
+            <div class="row">
+              <label><input type="radio" name="role" value="master" /> Master (its mouse and keyboard control the others)</label>
+            </div>
+            <div class="row">
+              <label><input type="radio" name="role" value="secondary" /> Secondary (controlled by the master)</label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Shared security key</legend>
+            <div class="row key-row">
+              <label for="pin">Security Key:</label>
+              <input id="pin" type="password" readonly />
+              <label class="inline"><input type="checkbox" id="show-pin" /> Show text</label>
+            </div>
+            <p class="hint">The same key is used on every PC. A computer asks for it only the first time it connects.</p>
+          </fieldset>
+
+          <fieldset class="grow" id="matrix-box">
+            <legend>Computer Matrix</legend>
+            <p class="hint" id="matrix-hint">Drag the computers to match how they sit on your desk.</p>
+            <div id="matrix" class="matrix"></div>
+            <div id="secondary-card" class="secondary-card" hidden></div>
+            <label class="two-row"><input type="checkbox" id="two-row" /> Two Row</label>
+          </fieldset>
+        </section>
+
+        <section class="panel" id="panel-options" hidden>
+          <fieldset>
+            <legend>Sharing</legend>
+            <div class="row"><label><input type="checkbox" id="opt-clipboard" /> Share clipboard (copied text)</label></div>
+            <div class="row indent"><label><input type="checkbox" id="opt-files" /> Transfer files</label></div>
+            <p class="hint indent">Files copied on one PC are saved in the Shared Files folder on the Desktop of the other PCs.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Keyboard shortcuts (on the master)</legend>
+            <table class="keys">
+              <tr><td>Ctrl + Alt + F1</td><td>Control this computer</td></tr>
+              <tr><td>Ctrl + Alt + F2</td><td>Control the next computer, left to right</td></tr>
+              <tr><td>Ctrl + Alt + F3</td><td>Control the third computer</td></tr>
+            </table>
+          </fieldset>
+        </section>
+
+        <section class="panel" id="panel-ip" hidden>
+          <fieldset>
+            <legend>Master address (secondary PCs only)</legend>
+            <div class="row key-row">
+              <label for="master-ip">Master IP:</label>
+              <input id="master-ip" type="text" inputmode="decimal" placeholder="e.g. 192.168.1.10" autocomplete="off" />
+            </div>
+            <p class="hint">Leave empty to find the master automatically. Fill it in only if automatic search does not work on your network. Changing it restarts the app.</p>
+          </fieldset>
+        </section>
+      </main>
+
+      <footer>
+        <div id="status" class="status" role="status"></div>
+        <div class="buttons">
+          <button id="apply" class="primary">Apply</button>
+          <button id="close">Close</button>
+        </div>
+      </footer>
+    </div>
+
+    <dialog id="about">
+      <img id="about-logo" alt="Vidyasagar Academy logo" width="110" height="110" />
+      <h1 id="about-name"></h1>
+      <p id="about-version" class="muted"></p>
+      <p id="about-dev"></p>
+      <p><strong id="about-org"></strong></p>
+      <p><button class="link" id="about-site"></button></p>
+      <p><button class="link" id="about-mail"></button></p>
+      <p class="muted" id="about-license"></p>
+      <form method="dialog"><button class="primary">OK</button></form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
