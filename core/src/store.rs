@@ -38,6 +38,10 @@ pub struct Settings {
     pub two_row: bool,
     pub share_clipboard: bool,
     pub transfer_files: bool,
+    pub start_with_windows: bool,
+    /// Secondary only: where the master was last found (tried when search fails).
+    pub last_master_addr: String,
+    pub last_master_id: String,
     pub cells: Vec<Cell>,
     pub peers: Vec<PairedPeer>,
 }
@@ -58,6 +62,9 @@ impl Settings {
             two_row: false,
             share_clipboard: true,
             transfer_files: true,
+            start_with_windows: true,
+            last_master_addr: String::new(),
+            last_master_id: String::new(),
             cells: Vec::new(),
             peers: Vec::new(),
         }
@@ -123,9 +130,50 @@ pub fn save(dir: &Path, s: &Settings) -> Result<()> {
     fs::rename(&tmp, settings_path(dir)).map_err(|e| AppError::Store(e.to_string()))
 }
 
+/// Save only what the running engine has learnt (pairings and, on the
+/// master, the arrangement; on a secondary, where the master was found).
+/// Everything else is taken from the file, so options the user changed in
+/// the window meanwhile are never put back to old values.
+pub fn save_learnt(dir: &Path, mine: &Settings, master: bool) -> Result<()> {
+    let mut out = match load(dir) {
+        Ok(Some(on_disk)) => on_disk,
+        _ => mine.clone(),
+    };
+    out.peers = mine.peers.clone();
+    if master {
+        out.cells = mine.cells.clone();
+        out.two_row = mine.two_row;
+    } else {
+        out.last_master_addr = mine.last_master_addr.clone();
+        out.last_master_id = mine.last_master_id.clone();
+    }
+    save(dir, &out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_saves_do_not_undo_options_changed_in_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine_copy = Settings::new("PC-1");
+        save(dir.path(), &engine_copy).unwrap();
+        // The user switches two options off in the window...
+        let mut window_copy = engine_copy.clone();
+        window_copy.start_with_windows = false;
+        window_copy.share_clipboard = false;
+        save(dir.path(), &window_copy).unwrap();
+        // ...and later the engine saves a new pairing from its older copy.
+        engine_copy.save_pairing("abc", "PC-2", &[7u8; 32]);
+        engine_copy.last_master_addr = "192.168.1.10:24800".into();
+        save_learnt(dir.path(), &engine_copy, false).unwrap();
+        let s = load(dir.path()).unwrap().unwrap();
+        assert!(!s.start_with_windows);
+        assert!(!s.share_clipboard);
+        assert_eq!(s.secret_for("abc"), Some([7u8; 32]));
+        assert_eq!(s.last_master_addr, "192.168.1.10:24800");
+    }
 
     #[test]
     fn save_load_roundtrip_and_pairing_lookup() {
@@ -150,6 +198,18 @@ mod tests {
         assert_eq!(s.secret_for("b1"), Some([2u8; 32]));
         s.forget("b1");
         assert!(s.peers.is_empty());
+    }
+
+    #[test]
+    fn settings_from_an_older_version_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"machineId":"abc","machineName":"PC-A","role":"secondary","peers":[]}"#;
+        fs::write(settings_path(dir.path()), old).unwrap();
+        let s = load(dir.path()).unwrap().unwrap();
+        assert_eq!(s.machine_id, "abc");
+        assert_eq!(s.role, "secondary");
+        assert!(s.start_with_windows);
+        assert!(s.last_master_addr.is_empty());
     }
 
     #[test]

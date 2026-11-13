@@ -1,27 +1,29 @@
 //! Runs a master or a secondary PC: connections, input sharing, clipboard and files.
 //! Windows only. Everything here is driven by the tested core modules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::channel::SecureReceiver;
 use crate::discovery::{
-    announce, listen_socket, wait_for_beacon, Beacon, CONNECT_PORT, DISCOVERY_PORT,
+    broadcast_targets, listen_socket, local_ipv4s, probe_bytes, recv_packet, send_to_all, Beacon,
+    Packet, CONNECT_PORT, DISCOVERY_PORT,
 };
 use crate::files::FileReceiver;
 use crate::handshake::{self, PeerInfo};
+use crate::held::{Held, KeyId, Route};
 use crate::layout::{layout_from_cells, Layout, Placed, Screen, GRID_COLS, GRID_ROWS};
 use crate::limiter::AttemptLimiter;
 use crate::platform::{self, Captured};
-use crate::protocol::{Message, FILE_CHUNK};
+use crate::protocol::{Button, Message, FILE_CHUNK, PROTOCOL_VERSION};
 use crate::router::{Action, Router};
 use crate::store::{self, Cell, Settings};
 use crate::{AppError, Result};
@@ -49,8 +51,12 @@ impl Options {
 
 /// Files larger than this are not shared automatically.
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Copied text longer than this is not shared (it must fit in one message).
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const PING_EVERY: Duration = Duration::from_secs(3);
 const DEAD_AFTER: Duration = Duration::from_secs(10);
+/// A held mouse button whose release never arrived is forgotten after this.
+const STALE_BUTTON: Duration = Duration::from_secs(60);
 
 /// Load saved settings or create them for the first run.
 pub fn load_settings(dir: &std::path::Path, machine_name: &str) -> Result<Settings> {
@@ -67,7 +73,7 @@ pub fn load_settings(dir: &std::path::Path, machine_name: &str) -> Result<Settin
 /// After a restart the old copy may still hold its ports for a moment.
 fn retry<T, E>(mut f: impl FnMut() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
     let mut last = f();
-    for _ in 0..15 {
+    for _ in 0..25 {
         if last.is_ok() {
             break;
         }
@@ -84,32 +90,104 @@ fn me(s: &Settings) -> PeerInfo {
     }
 }
 
-type Tx = SyncSender<Message>;
+/// Name Windows uses for this PC on the network.
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
+}
 
-fn queue(tx: &Tx, m: Message) {
-    match tx.try_send(m) {
-        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-        Err(TrySendError::Full(_)) => {} // peer is stuck; the heartbeat will drop it
+/// The discovery socket: the usual port if possible, otherwise any port
+/// (searching still works, because answers come back to whatever port asked).
+fn discovery_socket(log: &Log) -> Result<UdpSocket> {
+    match retry(|| listen_socket(DISCOVERY_PORT)) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            log(format!(
+                "Port {DISCOVERY_PORT} is in use by another program ({e}); searching continues on another port."
+            ));
+            listen_socket(0)
+        }
     }
 }
 
-/// Writer thread: sends queued messages, plus a heartbeat.
-fn spawn_writer(mut sender: crate::channel::SecureSender<TcpStream>, rx: Receiver<Message>) {
-    thread::spawn(move || loop {
-        match rx.recv_timeout(PING_EVERY) {
-            Ok(m) => {
-                if sender.send(&m).is_err() {
-                    return;
-                }
+/// The outgoing side of one connection. Mouse and keyboard go through `tx`
+/// and are always sent first; file data waits in `bulk`, so a large file
+/// never makes the mouse feel slow.
+#[derive(Clone)]
+struct Link {
+    tx: SyncSender<Message>,
+    bulk: SyncSender<Message>,
+}
+
+impl Link {
+    fn open(sender: crate::channel::SecureSender<TcpStream>) -> Link {
+        let (tx, rx) = sync_channel::<Message>(2048);
+        let (bulk, bulk_rx) = sync_channel::<Message>(8);
+        spawn_writer(sender, rx, bulk_rx);
+        Link { tx, bulk }
+    }
+
+    /// Queue an input message; never waits.
+    fn queue(&self, m: Message) {
+        // Full means the other PC is stuck; the heartbeat will drop it.
+        let _ = self.tx.try_send(m);
+    }
+
+    /// Queue file data; waits while the network is busy.
+    fn send_bulk(&self, m: Message) -> Result<()> {
+        self.bulk
+            .send(m)
+            .map_err(|_| AppError::Io("connection closed".into()))
+    }
+}
+
+/// Writer thread: input first, then file data, plus a heartbeat when idle.
+fn spawn_writer(
+    mut sender: crate::channel::SecureSender<TcpStream>,
+    rx: Receiver<Message>,
+    bulk: Receiver<Message>,
+) {
+    thread::spawn(move || {
+        let mut last = Instant::now();
+        loop {
+            let next = match rx.try_recv() {
+                Ok(m) => Some(m),
+                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => match bulk.try_recv() {
+                    Ok(m) => Some(m),
+                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => match rx.recv_timeout(Duration::from_millis(20)) {
+                        Ok(m) => Some(m),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    },
+                },
+            };
+            let msg = match next {
+                Some(m) => m,
+                None if last.elapsed() >= PING_EVERY => Message::Ping,
+                None => continue,
+            };
+            if sender.send(&msg).is_err() {
+                return;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if sender.send(&Message::Ping).is_err() {
-                    return;
-                }
-            }
-            Err(_) => return,
+            last = Instant::now();
         }
     });
+}
+
+fn prepare(stream: &TcpStream) -> Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(DEAD_AFTER))?;
+    // A PC that stopped answering must not block the sender forever.
+    stream.set_write_timeout(Some(DEAD_AFTER))?;
+    Ok(())
+}
+
+fn is_file_message(m: &Message) -> bool {
+    matches!(
+        m,
+        Message::FileOffer { .. } | Message::FileChunk { .. } | Message::FileEnd { .. }
+    )
 }
 
 // ------------------------------------------------------------------ sharing
@@ -136,10 +214,7 @@ impl Incoming {
 
     /// Returns true if the message was a sharing message (and so handled).
     fn handle(&mut self, msg: &Message, log: &Log) -> bool {
-        let is_file = matches!(
-            msg,
-            Message::FileOffer { .. } | Message::FileChunk { .. } | Message::FileEnd { .. }
-        );
+        let is_file = is_file_message(msg);
         if (is_file && !self.options.files.load(Ordering::Relaxed))
             || (matches!(msg, Message::ClipboardText(_))
                 && !self.options.clipboard.load(Ordering::Relaxed))
@@ -185,53 +260,58 @@ impl Incoming {
 }
 
 /// Reads a file and queues it for sending, `index` of `total` in its batch.
-fn send_file(
-    tx: &SyncSender<Message>,
-    path: &PathBuf,
-    id: u64,
-    index: u32,
-    total: u32,
-) -> Result<()> {
+fn send_file(link: &Link, path: &PathBuf, id: u64, index: u32, total: u32) -> Result<()> {
     let mut f = File::open(path)?;
     let size = f.metadata()?.len();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    tx.send(Message::FileOffer {
+    link.send_bulk(Message::FileOffer {
         id,
         name,
         size,
         index,
         total,
-    })
-    .map_err(|_| AppError::Io("connection closed".into()))?;
+    })?;
     let mut buf = vec![0u8; FILE_CHUNK];
-    loop {
+    let mut left = size;
+    while left > 0 {
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        tx.send(Message::FileChunk {
+        // Never send more than announced, even if the file is still growing.
+        let n = n.min(left.min(usize::MAX as u64) as usize);
+        left -= n as u64;
+        link.send_bulk(Message::FileChunk {
             id,
             data: buf[..n].to_vec(),
-        })
-        .map_err(|_| AppError::Io("connection closed".into()))?;
+        })?;
     }
-    tx.send(Message::FileEnd { id })
-        .map_err(|_| AppError::Io("connection closed".into()))
+    link.send_bulk(Message::FileEnd { id })
+}
+
+/// File ids must differ between PCs, because the master passes files on.
+fn file_id_base(machine_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    machine_id.hash(&mut h);
+    h.finish() << 32
 }
 
 /// Watches the local clipboard and sends changes to `targets()`.
 fn spawn_clipboard_watcher(
+    machine_id: &str,
     options: Arc<Options>,
     ignore_seq: Arc<Mutex<u32>>,
-    targets: impl Fn() -> Vec<Tx> + Send + 'static,
+    targets: impl Fn() -> Vec<Link> + Send + 'static,
     log: Log,
 ) {
+    let id_base = file_id_base(machine_id);
     thread::spawn(move || {
         let mut last = platform::clipboard_sequence();
-        let mut next_id = 1u64;
+        let mut counter = 0u64;
         loop {
             thread::sleep(Duration::from_millis(400));
             let now = platform::clipboard_sequence();
@@ -262,9 +342,9 @@ fn spawn_clipboard_watcher(
                     .collect();
                 let total = files.len() as u32;
                 for (i, f) in files.iter().enumerate() {
-                    next_id += 1;
-                    for tx in &peers {
-                        if let Err(e) = send_file(tx, f, next_id, i as u32, total) {
+                    counter = (counter + 1) & 0xFFFF_FFFF;
+                    for link in &peers {
+                        if let Err(e) = send_file(link, f, id_base | counter, i as u32, total) {
                             log(format!("Could not send {}: {e}", f.display()));
                         }
                     }
@@ -272,8 +352,12 @@ fn spawn_clipboard_watcher(
             } else if !options.clipboard.load(Ordering::Relaxed) {
                 continue;
             } else if let Some(t) = platform::get_clipboard_text() {
-                for tx in &peers {
-                    queue(tx, Message::ClipboardText(t.clone()));
+                if t.len() > MAX_TEXT_BYTES {
+                    log("The copied text is too long to share (over 1 MB).".to_string());
+                    continue;
+                }
+                for link in &peers {
+                    link.queue(Message::ClipboardText(t.clone()));
                 }
             }
         }
@@ -282,9 +366,14 @@ fn spawn_clipboard_watcher(
 
 // ------------------------------------------------------------------- master
 
+/// Gives every connection its own number, so a late clean-up of an old
+/// connection can never remove a newer connection of the same PC.
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+
 struct Peer {
-    tx: Tx,
+    link: Link,
     name: String,
+    conn: u64,
 }
 
 struct MasterState {
@@ -298,19 +387,48 @@ struct MasterState {
     local_size: (i32, i32),
     grabbed: bool,
     center: (i32, i32),
+    held: Held,
+    /// Ctrl / Alt as seen by our own hook (Windows does not report keys we hide).
+    ctrl: bool,
+    alt: bool,
+    last_button: Instant,
 }
 
 impl MasterState {
+    fn send_active(&self, m: Message) {
+        if let Some(p) = self.peers.get(self.router.active()) {
+            p.link.queue(m);
+        }
+    }
+
     fn apply(&mut self, actions: Vec<Action>, log: &Log) {
         for a in actions {
             match a {
                 Action::Leave { id } if id == self.local_id => {
                     self.grabbed = true;
+                    // From here on Ctrl and Alt are followed by our own hook.
+                    self.ctrl = false;
+                    self.alt = false;
                     platform::set_cursor_pos(self.center.0, self.center.1);
                 }
                 Action::Leave { id } => {
+                    // Release there whatever is still held there.
+                    let (keys, buttons) = self.held.release_remote();
                     if let Some(p) = self.peers.get(&id) {
-                        queue(&p.tx, Message::Leave);
+                        for (scancode, extended) in keys {
+                            p.link.queue(Message::Key {
+                                scancode,
+                                extended,
+                                down: false,
+                            });
+                        }
+                        for button in buttons {
+                            p.link.queue(Message::MouseButton {
+                                button,
+                                down: false,
+                            });
+                        }
+                        p.link.queue(Message::Leave);
                     }
                 }
                 Action::Enter { id, x, y } if id == self.local_id => {
@@ -324,7 +442,7 @@ impl MasterState {
                 Action::Enter { id, x, y } => {
                     if let Some(p) = self.peers.get(&id) {
                         log(format!("Mouse and keyboard now control {}", p.name));
-                        queue(&p.tx, Message::Enter { x, y });
+                        p.link.queue(Message::Enter { x, y });
                     }
                 }
                 Action::Forward { .. } => {
@@ -332,9 +450,7 @@ impl MasterState {
                     // other PC's pointer speed settings would otherwise make the
                     // real cursor drift away from what the router tracks.
                     let (x, y) = self.router.position();
-                    if let Some(p) = self.peers.get(self.router.active()) {
-                        queue(&p.tx, Message::MouseAbs { x, y });
-                    }
+                    self.send_active(Message::MouseAbs { x, y });
                 }
             }
         }
@@ -373,6 +489,17 @@ impl MasterState {
         Ok(())
     }
 
+    fn cell_list(&self) -> Vec<Cell> {
+        self.cells
+            .iter()
+            .map(|(id, (col, row))| Cell {
+                id: id.clone(),
+                col: *col,
+                row: *row,
+            })
+            .collect()
+    }
+
     /// Hotkey Ctrl+Alt+F1..F3: F1 is this PC, then the others left to right.
     fn nth_machine(&self, n: usize) -> Option<String> {
         if n == 0 {
@@ -385,12 +512,34 @@ impl MasterState {
     }
 }
 
+/// -1, 0 or 1: is `v` at the low edge, inside, or at the high edge of 0..size.
+fn edge(v: i32, size: i32) -> i32 {
+    if v >= size - 1 {
+        1
+    } else if v <= 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Runs inside the Windows input hook: must be quick and must never wait for
+/// the disk or the network (Windows removes hooks that answer slowly).
 fn hook_handler(shared: Arc<MasterShared>, log: Log) -> impl Fn(Captured) -> bool + Send + Sync {
     move |ev| {
-        let mut st = shared.state.lock().unwrap();
+        let mut guard = shared.state.lock().unwrap();
+        let st = &mut *guard;
+        if let Captured::Key { scancode, down, .. } = ev {
+            match scancode {
+                0x1D => st.ctrl = down,
+                0x38 => st.alt = down,
+                _ => {}
+            }
+        }
         match ev {
             Captured::Key { scancode, down, .. }
-                if platform::ctrl_alt_down() && (0x3B..=0x3D).contains(&scancode) =>
+                if (0x3B..=0x3D).contains(&scancode)
+                    && ((st.grabbed && st.ctrl && st.alt) || platform::ctrl_alt_down()) =>
             {
                 if down {
                     if let Some(id) = st.nth_machine((scancode - 0x3B) as usize) {
@@ -401,24 +550,15 @@ fn hook_handler(shared: Arc<MasterShared>, log: Log) -> impl Fn(Captured) -> boo
                 true
             }
             Captured::MouseMove { x, y } => {
+                if st.held.remote_button_held() && st.last_button.elapsed() > STALE_BUTTON {
+                    st.held.clear_remote_buttons();
+                }
                 if !st.grabbed {
                     st.router.sync_local(x, y);
                     let (w, h) = st.local_size;
-                    let dx = if x >= w - 1 {
-                        1
-                    } else if x <= 0 {
-                        -1
-                    } else {
-                        0
-                    };
-                    let dy = if y >= h - 1 {
-                        1
-                    } else if y <= 0 {
-                        -1
-                    } else {
-                        0
-                    };
-                    if dx != 0 || dy != 0 {
+                    let (dx, dy) = (edge(x, w), edge(y, h));
+                    // No switching in the middle of a drag.
+                    if (dx != 0 || dy != 0) && !platform::mouse_button_down() {
                         let acts = st.router.feed_delta(dx, dy);
                         st.apply(acts, &log);
                     }
@@ -426,7 +566,8 @@ fn hook_handler(shared: Arc<MasterShared>, log: Log) -> impl Fn(Captured) -> boo
                 } else {
                     let (dx, dy) = (x - st.center.0, y - st.center.1);
                     if dx != 0 || dy != 0 {
-                        let acts = st.router.feed_delta(dx, dy);
+                        let allow = !st.held.remote_button_held();
+                        let acts = st.router.feed(dx, dy, allow);
                         st.apply(acts, &log);
                         if st.grabbed {
                             platform::set_cursor_pos(st.center.0, st.center.1);
@@ -435,27 +576,37 @@ fn hook_handler(shared: Arc<MasterShared>, log: Log) -> impl Fn(Captured) -> boo
                     true
                 }
             }
-            other if st.grabbed => {
-                let msg = match other {
-                    Captured::MouseButton { button, down } => Message::MouseButton { button, down },
-                    Captured::Wheel { dx, dy } => Message::Wheel { dx, dy },
-                    Captured::Key {
-                        scancode,
-                        extended,
-                        down,
-                    } => Message::Key {
-                        scancode,
-                        extended,
-                        down,
-                    },
-                    Captured::MouseMove { .. } => return true,
-                };
-                if let Some(p) = st.peers.get(st.router.active()) {
-                    queue(&p.tx, msg);
+            Captured::MouseButton { button, down } => {
+                st.last_button = Instant::now();
+                match st.held.button(button, down, st.grabbed) {
+                    Route::Local => false,
+                    Route::Remote => {
+                        st.send_active(Message::MouseButton { button, down });
+                        true
+                    }
                 }
-                true
             }
-            _ => false,
+            Captured::Key {
+                scancode,
+                extended,
+                down,
+            } => match st.held.key((scancode, extended), down, st.grabbed) {
+                Route::Local => false,
+                Route::Remote => {
+                    st.send_active(Message::Key {
+                        scancode,
+                        extended,
+                        down,
+                    });
+                    true
+                }
+            },
+            Captured::Wheel { dx, dy } => {
+                if st.grabbed {
+                    st.send_active(Message::Wheel { dx, dy });
+                }
+                st.grabbed
+            }
         }
     }
 }
@@ -480,6 +631,8 @@ struct MasterShared {
     options: Arc<Options>,
     log: Log,
     me: PeerInfo,
+    /// Another PC that also says it is the master, and when it was last heard.
+    other_master: Mutex<Option<(String, Instant)>>,
 }
 
 #[derive(Clone)]
@@ -539,31 +692,38 @@ impl MasterHandle {
 
     /// Save the arrangement the user made and apply it to connected computers.
     pub fn set_cells(&self, cells: Vec<Cell>, two_row: bool) -> Result<()> {
-        let mut st = self.shared.state.lock().unwrap();
-        let old = st.cells.clone();
-        for c in &cells {
-            st.cells.insert(c.id.clone(), (c.col, c.row));
-        }
-        if let Err(e) = st.rebuild_layout() {
-            st.cells = old;
-            return Err(e);
-        }
+        let list = {
+            let mut st = self.shared.state.lock().unwrap();
+            let old = st.cells.clone();
+            for c in &cells {
+                st.cells.insert(c.id.clone(), (c.col, c.row));
+            }
+            if let Err(e) = st.rebuild_layout() {
+                st.cells = old;
+                return Err(e);
+            }
+            st.cell_list()
+        };
+        // The disk is touched only after the input state is unlocked.
         let mut set = self.shared.settings.lock().unwrap();
-        set.cells = st
-            .cells
-            .iter()
-            .map(|(id, (col, row))| Cell {
-                id: id.clone(),
-                col: *col,
-                row: *row,
-            })
-            .collect();
+        set.cells = list;
         set.two_row = two_row;
-        store::save(&self.shared.dir, &set)
+        store::save_learnt(&self.shared.dir, &set, true)
     }
 
     pub fn options(&self) -> Arc<Options> {
         self.shared.options.clone()
+    }
+
+    /// Something the user should fix, if anything.
+    pub fn warning(&self) -> Option<String> {
+        let other = self.shared.other_master.lock().unwrap();
+        match &*other {
+            Some((name, at)) if at.elapsed() < Duration::from_secs(8) => Some(format!(
+                "\"{name}\" is also set as Master. Only one PC can be the master: on the other PCs choose \"Secondary\" in Machine Setup and press Apply."
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -590,6 +750,10 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
         local_size: size,
         grabbed: false,
         center: (size.0 / 2, size.1 / 2),
+        held: Held::default(),
+        ctrl: false,
+        alt: false,
+        last_button: Instant::now(),
     };
     st.rebuild_layout()?;
     let options = Options::from_settings(&settings);
@@ -602,19 +766,46 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
         ignore_seq: Arc::new(Mutex::new(0u32)),
         options: options.clone(),
         log: log.clone(),
+        other_master: Mutex::new(None),
     });
 
-    // The hook handler needs the state alone, so give it a small adapter.
-    let hook_shared = shared.clone();
-    platform::start_capture(hook_handler(hook_shared, log.clone()))?;
+    // Take the connection port first: if it is busy nothing else should start.
+    let listener = retry(|| TcpListener::bind(("0.0.0.0", CONNECT_PORT))).map_err(|e| {
+        AppError::Io(format!(
+            "cannot listen on port {CONNECT_PORT} (is another copy running?): {e}"
+        ))
+    })?;
 
-    // Tell the network we are here.
+    platform::start_capture(hook_handler(shared.clone(), log.clone()))?;
+
+    // Tell the network we are here, and answer PCs that are searching.
     {
-        let beacon = Beacon::new(&settings.machine_id, &settings.machine_name, true);
-        let target: SocketAddr = ([255, 255, 255, 255], DISCOVERY_PORT).into();
+        let sock = discovery_socket(&log)?;
+        let bytes = Beacon::new(&settings.machine_id, &settings.machine_name, true).to_bytes()?;
+        let sh = shared.clone();
+        thread::spawn(move || master_discovery(&sock, &bytes, &sh));
+    }
+
+    // Notice a changed screen resolution, and keep this PC awake while its
+    // mouse and keyboard are busy on another PC.
+    {
+        let sh = shared.clone();
         thread::spawn(move || loop {
-            let _ = announce(&beacon, target);
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(3));
+            let size = platform::screen_size();
+            let mut st = sh.state.lock().unwrap();
+            if st.grabbed {
+                platform::keep_awake();
+            }
+            if size != st.local_size && size.0 > 0 && size.1 > 0 {
+                st.local_size = size;
+                st.center = (size.0 / 2, size.1 / 2);
+                let id = st.local_id.clone();
+                if let Some(e) = st.sizes.iter_mut().find(|e| e.0 == id) {
+                    *e = (id, size.0, size.1);
+                }
+                let _ = st.rebuild_layout();
+            }
         });
     }
 
@@ -622,6 +813,7 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
     {
         let sh = shared.clone();
         spawn_clipboard_watcher(
+            &settings.machine_id,
             options,
             shared.ignore_seq.clone(),
             move || {
@@ -630,18 +822,13 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
                     .unwrap()
                     .peers
                     .values()
-                    .map(|p| p.tx.clone())
+                    .map(|p| p.link.clone())
                     .collect()
             },
             log.clone(),
         );
     }
 
-    let listener = retry(|| TcpListener::bind(("0.0.0.0", CONNECT_PORT))).map_err(|e| {
-        AppError::Io(format!(
-            "cannot listen on port {CONNECT_PORT} (is another copy running?): {e}"
-        ))
-    })?;
     log(format!(
         "Master \"{}\" is ready. Hotkeys: Ctrl+Alt+F1 = this PC, F2/F3 = other PCs.",
         settings.machine_name
@@ -649,7 +836,10 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
     let accept_shared = shared.clone();
     thread::spawn(move || {
         for conn in listener.incoming() {
-            let Ok(stream) = conn else { continue };
+            let Ok(stream) = conn else {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            };
             let sh = accept_shared.clone();
             thread::spawn(move || {
                 if let Err(e) = master_connection(stream, &sh) {
@@ -661,13 +851,44 @@ pub fn start_master(settings_dir: PathBuf, settings: Settings, log: Log) -> Resu
     Ok(MasterHandle { shared })
 }
 
+fn master_discovery(sock: &UdpSocket, beacon: &[u8], sh: &MasterShared) {
+    let host = host_name();
+    let mut targets = Vec::new();
+    let mut round = 0u32;
+    loop {
+        // Network adapters come and go (Wi-Fi reconnects, sleep): look again regularly.
+        if round.is_multiple_of(5) {
+            targets = broadcast_targets(&local_ipv4s(&host), DISCOVERY_PORT);
+        }
+        round = round.wrapping_add(1);
+        send_to_all(sock, beacon, &targets);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match recv_packet(sock, &sh.me.id, left) {
+                // A secondary is searching: answer it directly.
+                Ok(Some((Packet::Probe { .. }, from))) => {
+                    let _ = sock.send_to(beacon, from);
+                }
+                Ok(Some((Packet::Beacon(b), _))) if b.is_master => {
+                    *sh.other_master.lock().unwrap() = Some((b.name, Instant::now()));
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    }
+}
+
 fn master_connection(stream: TcpStream, sh: &Arc<MasterShared>) -> Result<()> {
     let ip: IpAddr = stream.peer_addr()?.ip();
     if let Err(secs) = sh.limiter.lock().unwrap().check(ip, Instant::now()) {
         return Err(AppError::LockedOut(secs));
     }
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(DEAD_AFTER))?;
+    prepare(&stream)?;
     let result = handshake::accept(
         stream,
         &sh.me,
@@ -680,7 +901,7 @@ fn master_connection(stream: TcpStream, sh: &Arc<MasterShared>) -> Result<()> {
             e
         }
         Err(e) => {
-            if matches!(e, AppError::WrongPin | AppError::PairingRejected) {
+            if matches!(e, AppError::WrongPin) {
                 sh.limiter
                     .lock()
                     .unwrap()
@@ -693,7 +914,7 @@ fn master_connection(stream: TcpStream, sh: &Arc<MasterShared>) -> Result<()> {
     if let Some(secret) = est.new_secret {
         let mut s = sh.settings.lock().unwrap();
         s.save_pairing(&est.peer.id, &est.peer.name, &secret);
-        store::save(&sh.dir, &s)?;
+        store::save_learnt(&sh.dir, &s, true)?;
         log(format!("{} paired successfully.", est.peer.name));
     }
     let peer = est.peer;
@@ -704,9 +925,8 @@ fn master_connection(stream: TcpStream, sh: &Arc<MasterShared>) -> Result<()> {
         Message::ScreenInfo { width, height } if width > 0 && height > 0 => (width, height),
         _ => return Err(AppError::Protocol("screen size missing".into())),
     };
-    let (tx, rx) = sync_channel::<Message>(1024);
-    spawn_writer(sender, rx);
-    {
+    let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+    let cells = {
         let mut st = sh.state.lock().unwrap();
         if st.sizes.len() >= crate::layout::MAX_MACHINES && !st.sizes.iter().any(|s| s.0 == peer.id)
         {
@@ -714,69 +934,105 @@ fn master_connection(stream: TcpStream, sh: &Arc<MasterShared>) -> Result<()> {
                 "this master already has 3 computers".into(),
             ));
         }
+        // The same PC may connect again before its old connection has timed out.
+        let before = st.sizes.iter().find(|s| s.0 == peer.id).cloned();
         st.sizes.retain(|s| s.0 != peer.id);
         st.sizes.push((peer.id.clone(), w, h));
+        if let Err(e) = st.rebuild_layout() {
+            st.sizes.retain(|s| s.0 != peer.id);
+            st.sizes.extend(before);
+            let _ = st.rebuild_layout();
+            return Err(e);
+        }
         st.peers.insert(
             peer.id.clone(),
             Peer {
-                tx: tx.clone(),
+                link: Link::open(sender),
                 name: peer.name.clone(),
+                conn,
             },
         );
-        if let Err(e) = st.rebuild_layout() {
-            st.sizes.retain(|s| s.0 != peer.id);
-            st.peers.remove(&peer.id);
-            return Err(e);
-        }
+        st.cell_list()
+    };
+    {
         let mut set = sh.settings.lock().unwrap();
-        set.cells = st
-            .cells
-            .iter()
-            .map(|(id, (col, row))| Cell {
-                id: id.clone(),
-                col: *col,
-                row: *row,
-            })
-            .collect();
-        let _ = store::save(&sh.dir, &set);
+        set.cells = cells;
+        let _ = store::save_learnt(&sh.dir, &set, true);
     }
     log(format!("{} connected ({}x{}).", peer.name, w, h));
 
-    let mut incoming = Incoming::new(sh.ignore_seq.clone(), sh.options.clone())?;
-    let outcome = master_receive(&mut receiver, &mut incoming, &sh.state, &peer, log);
+    let outcome = match Incoming::new(sh.ignore_seq.clone(), sh.options.clone()) {
+        Ok(mut incoming) => master_receive(&mut receiver, &mut incoming, sh, &peer, conn),
+        Err(e) => Err(e),
+    };
 
-    // Connection gone: take the cursor back if this PC had it.
+    // Connection gone: take the cursor back if this PC had it. A newer
+    // connection of the same PC is left alone.
     let mut st = sh.state.lock().unwrap();
-    st.peers.remove(&peer.id);
-    let acts = st.router.machine_lost(&peer.id);
-    st.apply(acts, log);
-    st.sizes.retain(|s| s.0 != peer.id);
-    let _ = st.rebuild_layout();
-    log(format!("{} disconnected.", peer.name));
+    if st.peers.get(&peer.id).is_some_and(|p| p.conn == conn) {
+        st.peers.remove(&peer.id);
+        let acts = st.router.machine_lost(&peer.id);
+        if !acts.is_empty() {
+            st.held.release_remote();
+        }
+        st.apply(acts, log);
+        st.sizes.retain(|s| s.0 != peer.id);
+        let _ = st.rebuild_layout();
+        log(format!("{} disconnected.", peer.name));
+    }
     outcome
 }
 
 fn master_receive(
     receiver: &mut SecureReceiver<TcpStream>,
     incoming: &mut Incoming,
-    state: &Mutex<MasterState>,
+    sh: &MasterShared,
     peer: &PeerInfo,
-    log: &Log,
+    conn: u64,
 ) -> Result<()> {
+    let log = &sh.log;
     loop {
         let msg = receiver.recv()?;
-        if incoming.handle(&msg, log) {
-            // Pass what a secondary copied on to the other secondaries.
-            if matches!(msg, Message::ClipboardText(_)) {
-                for (id, p) in state.lock().unwrap().peers.iter() {
-                    if *id != peer.id {
-                        queue(&p.tx, msg.clone());
-                    }
+        // A newer connection of this PC has taken over: stop quietly.
+        let others: Vec<Link> = {
+            let st = sh.state.lock().unwrap();
+            if st.peers.get(&peer.id).is_none_or(|p| p.conn != conn) {
+                return Ok(());
+            }
+            st.peers
+                .iter()
+                .filter(|(id, _)| **id != peer.id)
+                .map(|(_, p)| p.link.clone())
+                .collect()
+        };
+        if let Message::ScreenInfo { width, height } = msg {
+            // The secondary changed its screen resolution.
+            if width > 0 && height > 0 {
+                let mut st = sh.state.lock().unwrap();
+                if let Some(e) = st.sizes.iter_mut().find(|e| e.0 == peer.id) {
+                    *e = (peer.id.clone(), width, height);
                 }
+                let _ = st.rebuild_layout();
             }
-            if let Message::FileEnd { .. } = msg {
-                finish_batch(incoming, log);
+            continue;
+        }
+        let is_file = is_file_message(&msg);
+        let is_text = matches!(msg, Message::ClipboardText(_));
+        if !incoming.handle(&msg, log) {
+            continue;
+        }
+        // Pass what a secondary copied on to the other secondaries.
+        if is_text && sh.options.clipboard.load(Ordering::Relaxed) {
+            for l in &others {
+                l.queue(msg.clone());
             }
+        } else if is_file && sh.options.files.load(Ordering::Relaxed) {
+            for l in &others {
+                let _ = l.send_bulk(msg.clone());
+            }
+        }
+        if let Message::FileEnd { .. } = msg {
+            finish_batch(incoming, log);
         }
     }
 }
@@ -795,20 +1051,51 @@ fn finish_batch(incoming: &mut Incoming, log: &Log) {
 
 // ---------------------------------------------------------------- secondary
 
+struct SecondaryShared {
+    connected_to: Mutex<Option<String>>,
+    link: Mutex<Option<Link>>,
+    /// When the current search for the master began.
+    searching_since: Mutex<Option<Instant>>,
+    /// A problem found while searching that the user should know about.
+    problem: Mutex<Option<String>>,
+    settings: Mutex<Settings>,
+    dir: PathBuf,
+    ignore_seq: Arc<Mutex<u32>>,
+    options: Arc<Options>,
+    log: Log,
+}
+
 #[derive(Clone)]
 pub struct SecondaryHandle {
-    connected_to: Arc<Mutex<Option<String>>>,
-    options: Arc<Options>,
+    shared: Arc<SecondaryShared>,
 }
 
 impl SecondaryHandle {
     /// Name of the master we are connected to, if any.
     pub fn connected_to(&self) -> Option<String> {
-        self.connected_to.lock().unwrap().clone()
+        self.shared.connected_to.lock().unwrap().clone()
     }
 
     pub fn options(&self) -> Arc<Options> {
-        self.options.clone()
+        self.shared.options.clone()
+    }
+
+    /// Something the user should fix, if anything.
+    pub fn warning(&self) -> Option<String> {
+        if self.connected_to().is_some() {
+            return None;
+        }
+        if let Some(p) = self.shared.problem.lock().unwrap().clone() {
+            return Some(p);
+        }
+        let since = *self.shared.searching_since.lock().unwrap();
+        match since {
+            Some(t) if t.elapsed() > Duration::from_secs(20) => Some(
+                "The master PC has not been found yet. Check that it is switched on, signed in, set as Master and on the same network. If it still fails, press \"Allow through firewall\" on the master PC."
+                    .into(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -825,87 +1112,210 @@ pub fn start_secondary(
         None
     } else {
         let ip = settings.master_ip.trim();
-        Some(
-            format!("{ip}:{CONNECT_PORT}")
-                .parse()
-                .map_err(|_| AppError::Io(format!("\"{ip}\" is not a valid address")))?,
-        )
+        Some(SocketAddr::new(
+            ip.parse::<IpAddr>().map_err(|_| {
+                AppError::Io(format!(
+                    "\"{ip}\" is not a valid address (example: 192.168.1.10)"
+                ))
+            })?,
+            CONNECT_PORT,
+        ))
     };
-    let sock = if fixed.is_none() {
-        Some(retry(|| listen_socket(DISCOVERY_PORT))?)
-    } else {
-        None
+    let sock = match fixed {
+        None => Some(discovery_socket(&log)?),
+        Some(_) => None,
     };
     let my_id = settings.machine_id.clone();
-    let settings = Arc::new(Mutex::new(settings));
-    let ignore_seq = Arc::new(Mutex::new(0u32));
-    let current_tx: Arc<Mutex<Option<Tx>>> = Arc::new(Mutex::new(None));
-    let connected_to: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let shared = Arc::new(SecondaryShared {
+        connected_to: Mutex::new(None),
+        link: Mutex::new(None),
+        searching_since: Mutex::new(Some(Instant::now())),
+        problem: Mutex::new(None),
+        settings: Mutex::new(settings),
+        dir: settings_dir,
+        ignore_seq: Arc::new(Mutex::new(0u32)),
+        options: options.clone(),
+        log: log.clone(),
+    });
     {
-        let ct = current_tx.clone();
+        let sh = shared.clone();
         spawn_clipboard_watcher(
-            options.clone(),
-            ignore_seq.clone(),
-            move || ct.lock().unwrap().iter().cloned().collect(),
+            &my_id,
+            options,
+            shared.ignore_seq.clone(),
+            move || sh.link.lock().unwrap().iter().cloned().collect(),
             log.clone(),
         );
     }
-    let handle = SecondaryHandle {
-        connected_to: connected_to.clone(),
-        options: options.clone(),
-    };
+    let sh = shared.clone();
     thread::spawn(move || {
         log("Looking for the master PC...".to_string());
+        let mut round = 0u32;
         loop {
-            let (master_id, addr) = match (&sock, fixed) {
-                (Some(s), _) => match wait_for_beacon(s, &my_id, Duration::from_secs(2)) {
-                    Ok(Some((b, from))) if b.is_master => {
-                        (b.id, SocketAddr::new(from.ip(), b.port))
+            let found = match (&sock, fixed) {
+                (Some(s), _) => find_master(s, &my_id, &sh, &mut round),
+                (None, Some(a)) => {
+                    let set = sh.settings.lock().unwrap();
+                    // The id is known if this address worked before.
+                    let id = if set.last_master_addr == a.to_string() {
+                        set.last_master_id.clone()
+                    } else {
+                        String::new()
+                    };
+                    Found {
+                        id,
+                        addr: a,
+                        guess: false,
                     }
-                    _ => continue,
-                },
-                (None, Some(a)) => (String::new(), a),
+                }
                 _ => return,
             };
-            let ctx = SecondaryCtx {
-                dir: &settings_dir,
-                settings: &settings,
-                ignore_seq: &ignore_seq,
-                options: &options,
-                current_tx: &current_tx,
-                connected_to: &connected_to,
-                log: &log,
-            };
-            let res = secondary_session(&ctx, &master_id, addr);
-            *current_tx.lock().unwrap() = None;
-            *connected_to.lock().unwrap() = None;
-            if let Err(e) = res {
-                log(format!("Disconnected: {e}"));
+            let res = secondary_session(&sh, &found.id, found.addr);
+            let was_connected = sh.connected_to.lock().unwrap().take().is_some();
+            *sh.link.lock().unwrap() = None;
+            match res {
+                // A blind try of the last known address may fail quietly.
+                Err(_) if found.guess && !was_connected => {}
+                Err(e) if was_connected => log(format!("Disconnected: {e}")),
+                Err(e) => log(format!("Could not connect to the master PC: {e}")),
+                Ok(()) => {}
             }
-            thread::sleep(Duration::from_secs(2));
-            log("Looking for the master PC...".to_string());
+            if was_connected {
+                *sh.searching_since.lock().unwrap() = Some(Instant::now());
+                log("Looking for the master PC...".to_string());
+            }
+            thread::sleep(Duration::from_secs(if was_connected { 1 } else { 2 }));
         }
     });
-    Ok(handle)
+    Ok(SecondaryHandle { shared })
 }
 
-struct SecondaryCtx<'a> {
-    dir: &'a std::path::Path,
-    settings: &'a Arc<Mutex<Settings>>,
-    ignore_seq: &'a Arc<Mutex<u32>>,
-    options: &'a Arc<Options>,
-    current_tx: &'a Arc<Mutex<Option<Tx>>>,
-    connected_to: &'a Arc<Mutex<Option<String>>>,
-    log: &'a Log,
+struct Found {
+    id: String,
+    addr: SocketAddr,
+    /// True when nothing answered and the last known address is being tried.
+    guess: bool,
 }
 
-fn secondary_session(c: &SecondaryCtx, master_id: &str, addr: SocketAddr) -> Result<()> {
+/// Search the network until a master answers. Every few rounds without an
+/// answer, the address where the master was last seen is offered instead.
+fn find_master(sock: &UdpSocket, my_id: &str, sh: &SecondaryShared, round: &mut u32) -> Found {
+    let host = host_name();
+    let probe = probe_bytes(my_id);
+    loop {
+        *round = round.wrapping_add(1);
+        let (last_addr, last_id) = {
+            let s = sh.settings.lock().unwrap();
+            (
+                s.last_master_addr.parse::<SocketAddr>().ok(),
+                s.last_master_id.clone(),
+            )
+        };
+        let mut targets = broadcast_targets(&local_ipv4s(&host), DISCOVERY_PORT);
+        if let Some(a) = last_addr {
+            targets.push(SocketAddr::new(a.ip(), DISCOVERY_PORT));
+        }
+        send_to_all(sock, &probe, &targets);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match recv_packet(sock, my_id, left) {
+                Ok(Some((Packet::Beacon(b), from))) if b.is_master => {
+                    if b.version != PROTOCOL_VERSION {
+                        *sh.problem.lock().unwrap() = Some(format!(
+                            "\"{}\" runs a different version of this program. Install the same version on every PC.",
+                            b.name
+                        ));
+                        continue;
+                    }
+                    *sh.problem.lock().unwrap() = None;
+                    return Found {
+                        id: b.id,
+                        addr: SocketAddr::new(from.ip(), b.port),
+                        guess: false,
+                    };
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(200)),
+            }
+        }
+        if (*round).is_multiple_of(4) {
+            if let Some(addr) = last_addr {
+                return Found {
+                    id: last_id,
+                    addr,
+                    guess: true,
+                };
+            }
+        }
+    }
+}
+
+/// Keys and buttons the master is holding down on this PC. If the connection
+/// is lost they are released, so nothing stays stuck.
+#[derive(Default)]
+struct Pressed {
+    keys: HashSet<KeyId>,
+    buttons: HashSet<Button>,
+}
+
+impl Pressed {
+    fn note(&mut self, m: &Message) {
+        match *m {
+            Message::Key {
+                scancode,
+                extended,
+                down,
+            } => {
+                if down {
+                    self.keys.insert((scancode, extended));
+                } else {
+                    self.keys.remove(&(scancode, extended));
+                }
+            }
+            Message::MouseButton { button, down } => {
+                if down {
+                    self.buttons.insert(button);
+                } else {
+                    self.buttons.remove(&button);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn release_all(&mut self) {
+        for (scancode, extended) in self.keys.drain() {
+            platform::inject(&Message::Key {
+                scancode,
+                extended,
+                down: false,
+            });
+        }
+        for button in self.buttons.drain() {
+            platform::inject(&Message::MouseButton {
+                button,
+                down: false,
+            });
+        }
+    }
+}
+
+impl Drop for Pressed {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+fn secondary_session(sh: &SecondaryShared, master_id: &str, addr: SocketAddr) -> Result<()> {
     let try_connect = |pin: Option<&str>| -> Result<handshake::Established<TcpStream>> {
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(DEAD_AFTER))?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))?;
+        prepare(&stream)?;
         let (my, secret) = {
-            let s = c.settings.lock().unwrap();
+            let s = sh.settings.lock().unwrap();
             (me(&s), s.secret_for(master_id))
         };
         handshake::connect(stream, &my, master_id, secret, pin)
@@ -913,45 +1323,92 @@ fn secondary_session(c: &SecondaryCtx, master_id: &str, addr: SocketAddr) -> Res
     // Every PC uses the same fixed PIN, so there is nothing to ask the user.
     let est = match try_connect(None) {
         Err(AppError::PinRequired) => try_connect(Some(crate::SHARED_PIN))?,
+        Err(AppError::PairingRejected) => {
+            // The saved pairing no longer matches (the program was set up
+            // again on one of the PCs): forget it and pair again with the PIN.
+            {
+                let mut s = sh.settings.lock().unwrap();
+                s.forget(master_id);
+                let _ = store::save_learnt(&sh.dir, &s, false);
+            }
+            try_connect(Some(crate::SHARED_PIN))?
+        }
         other => other?,
     };
     let peer = est.peer.clone();
-    if let Some(secret) = est.new_secret {
-        let mut s = c.settings.lock().unwrap();
-        s.save_pairing(&peer.id, &peer.name, &secret);
-        store::save(c.dir, &s)?;
+    {
+        let mut s = sh.settings.lock().unwrap();
+        let addr_text = addr.to_string();
+        let mut changed = false;
+        if let Some(secret) = est.new_secret {
+            s.save_pairing(&peer.id, &peer.name, &secret);
+            changed = true;
+        }
+        if s.last_master_addr != addr_text || s.last_master_id != peer.id {
+            s.last_master_addr = addr_text;
+            s.last_master_id = peer.id.clone();
+            changed = true;
+        }
+        if changed {
+            store::save_learnt(&sh.dir, &s, false)?;
+        }
     }
     let (sender, mut receiver) = est.channel.split(|s| s.try_clone())?;
-    let (tx, rx) = sync_channel::<Message>(1024);
-    spawn_writer(sender, rx);
-    let (w, h) = platform::screen_size();
-    queue(
-        &tx,
-        Message::ScreenInfo {
-            width: w,
-            height: h,
-        },
-    );
-    *c.current_tx.lock().unwrap() = Some(tx);
-    *c.connected_to.lock().unwrap() = Some(peer.name.clone());
-    (c.log)(format!("Connected to {}.", peer.name));
+    let link = Link::open(sender);
+    let mut size = platform::screen_size();
+    link.queue(Message::ScreenInfo {
+        width: size.0,
+        height: size.1,
+    });
+    let mut incoming = Incoming::new(sh.ignore_seq.clone(), sh.options.clone())?;
+    *sh.link.lock().unwrap() = Some(link.clone());
+    *sh.connected_to.lock().unwrap() = Some(peer.name.clone());
+    *sh.searching_since.lock().unwrap() = None;
+    *sh.problem.lock().unwrap() = None;
+    (sh.log)(format!("Connected to {}.", peer.name));
 
-    let mut incoming = Incoming::new(c.ignore_seq.clone(), c.options.clone())?;
+    let mut pressed = Pressed::default();
+    let mut checked = Instant::now();
+    let mut awake: Option<Instant> = None;
     loop {
+        // The master sends a heartbeat every few seconds, so this loop turns
+        // regularly even when nobody touches the mouse.
         let msg = receiver.recv()?;
-        if incoming.handle(&msg, c.log) {
+        if checked.elapsed() >= Duration::from_secs(2) {
+            checked = Instant::now();
+            let now = platform::screen_size();
+            if now != size && now.0 > 0 && now.1 > 0 {
+                size = now;
+                link.queue(Message::ScreenInfo {
+                    width: now.0,
+                    height: now.1,
+                });
+            }
+        }
+        if incoming.handle(&msg, &sh.log) {
             if let Message::FileEnd { .. } = msg {
-                finish_batch(&mut incoming, c.log);
+                finish_batch(&mut incoming, &sh.log);
             }
             continue;
         }
         match msg {
             Message::Ping
             | Message::Pong
-            | Message::Leave
             | Message::PairingSecret(_)
             | Message::ScreenInfo { .. } => {}
-            other => platform::inject(&other),
+            Message::Leave => pressed.release_all(),
+            other => {
+                if matches!(other, Message::Enter { .. }) {
+                    // Switch a sleeping screen back on when the cursor arrives.
+                    platform::wake_screen();
+                    awake = Some(Instant::now());
+                } else if awake.is_none_or(|t| t.elapsed() >= Duration::from_secs(20)) {
+                    platform::keep_awake();
+                    awake = Some(Instant::now());
+                }
+                pressed.note(&other);
+                platform::inject(&other);
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 import "./style.css";
 import logoUrl from "./assets/logo.png";
-import { applySettings, getAppInfo, getState, hideWindow, openLink } from "./api";
+import { allowFirewall, applySettings, getAppInfo, getState, hideWindow, openLink } from "./api";
 import type { AppState, Cell, Machine, Role } from "./types";
 
 const COLS = 3;
@@ -52,9 +52,11 @@ function renderMatrix(): void {
   $("matrix-hint").hidden = !isMaster;
   if (!isMaster) {
     const host = state.connectedTo;
+    const waiting = state.role === "secondary" ? "Looking for the master PC on the network…" : "Press Apply to make this computer a secondary.";
+    secondaryCard.classList.toggle("warn", !host && !!state.warning);
     secondaryCard.textContent = host
       ? `Connected to ${host}. Move the mouse on the master PC to control this computer.`
-      : "Looking for the master PC on the network…";
+      : state.role === "secondary" && state.warning ? state.warning : waiting;
     return;
   }
   matrix.style.gridTemplateRows = `repeat(${rows()}, 1fr)`;
@@ -167,6 +169,7 @@ function packIntoOneRow(): void {
 
 function setStatus(text: string, error = false): void {
   statusEl.textContent = text;
+  statusEl.title = text;
   statusEl.classList.toggle("error", error);
 }
 
@@ -174,8 +177,10 @@ function summary(): void {
   if (!state || dirty) return;
   if (state.engineError) return setStatus(state.engineError, true);
   if (state.role === "secondary") {
-    return setStatus(state.connectedTo ? `Connected to ${state.connectedTo}` : "Looking for the master PC…");
+    if (state.connectedTo) return setStatus(`Connected to ${state.connectedTo}`);
+    return state.warning ? setStatus(state.warning, true) : setStatus("Looking for the master PC…");
   }
+  if (state.warning) return setStatus(state.warning, true);
   const others = state.machines.filter((m) => !m.isLocal && m.connected).length;
   setStatus(others === 0 ? "Ready. Waiting for other computers to connect." : `${others} other computer${others === 1 ? "" : "s"} connected.`);
 }
@@ -187,6 +192,7 @@ function loadForm(s: AppState): void {
   $<HTMLInputElement>("opt-clipboard").checked = s.shareClipboard;
   $<HTMLInputElement>("opt-files").checked = s.transferFiles;
   $<HTMLInputElement>("master-ip").value = s.masterIp;
+  $<HTMLInputElement>("opt-autostart").checked = s.startWithWindows;
   formLoaded = true;
 }
 
@@ -200,6 +206,7 @@ async function refresh(): Promise<void> {
   if (!formLoaded) loadForm(state);
   if (!dirty) cells = new Map();
   if (!document.querySelector(".thumb.dragging")) renderMatrix();
+  $("my-address").textContent = state.addresses.length ? state.addresses.join("  or  ") : "not connected to a network";
   summary();
 }
 
@@ -215,6 +222,7 @@ async function apply(): Promise<void> {
       shareClipboard: $<HTMLInputElement>("opt-clipboard").checked,
       transferFiles: $<HTMLInputElement>("opt-files").checked,
       masterIp: $<HTMLInputElement>("master-ip").value,
+      startWithWindows: $<HTMLInputElement>("opt-autostart").checked,
       twoRow: twoRow.checked,
       cells: list,
     });
@@ -258,7 +266,13 @@ function wire(): void {
     dirty = true;
     renderMatrix();
   });
-  for (const id of ["opt-clipboard", "opt-files", "master-ip"]) $(id).addEventListener("input", () => { dirty = true; });
+  $("firewall").addEventListener("click", () => {
+    allowFirewall().then(
+      () => { $("firewall-note").textContent = "Permission requested. If you answered Yes, this PC is now allowed on every network."; },
+      (e) => { $("firewall-note").textContent = String(e); },
+    );
+  });
+  for (const id of ["opt-clipboard", "opt-files", "opt-autostart", "master-ip"]) $(id).addEventListener("input", () => { dirty = true; });
   $("apply").addEventListener("click", () => void apply());
   $("close").addEventListener("click", () => void hideWindow());
   $("about-link").addEventListener("click", () => void showAbout());

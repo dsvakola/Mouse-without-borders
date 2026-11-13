@@ -9,6 +9,7 @@ let state: AppState = {
   shareClipboard: true,
   transferFiles: true,
   masterIp: "",
+  startWithWindows: true,
   machines: [
     { id: "a", name: "seniorTeacher", isLocal: true, connected: true, col: 0, row: 0 },
     { id: "b", name: "OLDLAPTOP", isLocal: false, connected: true, col: 1, row: 0 },
@@ -16,6 +17,8 @@ let state: AppState = {
   ],
   connectedTo: null,
   engineError: null,
+  warning: null,
+  addresses: ["192.168.1.7"],
   log: ["OLDLAPTOP connected (1366x768)."],
 };
 
@@ -30,6 +33,7 @@ export function mockApply(req: ApplyRequest): boolean {
     shareClipboard: req.shareClipboard,
     transferFiles: req.transferFiles,
     masterIp: req.masterIp,
+    startWithWindows: req.startWithWindows,
     twoRow: req.twoRow,
     machines: state.machines.map((m) => {
       const c = req.cells.find((x) => x.id === m.id);
@@ -42,7 +46,7 @@ export function mockApply(req: ApplyRequest): boolean {
 export function mockInfo(): AppInfo {
   return {
     name: "Mouse without borders",
-    version: "0.1.2",
+    version: "0.2.0",
     developers: "Prof. Dattaraj S. Vidyasagar & Prof. Yash D. Vidyasagar",
     organisation: "Vidyasagar Academy",
     website: "https://vsa.edu.in/software/",

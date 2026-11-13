@@ -63,6 +63,11 @@ impl Router {
             }
             self.active = self.local.clone();
         }
+        // A screen may have changed size (new resolution): stay inside it.
+        if let Some(s) = layout.screen(&self.active) {
+            self.x = self.x.clamp(0, (s.width - 1).max(0));
+            self.y = self.y.clamp(0, (s.height - 1).max(0));
+        }
         self.layout = layout;
     }
 
@@ -114,6 +119,13 @@ impl Router {
     }
 
     pub fn feed_delta(&mut self, dx: i32, dy: i32) -> Vec<Action> {
+        self.feed(dx, dy, true)
+    }
+
+    /// Like `feed_delta`; with `allow_switch` false the cursor stops at the
+    /// edge instead of moving to another computer (used while a mouse button
+    /// is held, so a drag is never cut in half).
+    pub fn feed(&mut self, dx: i32, dy: i32, allow_switch: bool) -> Vec<Action> {
         let cur = match self.layout.screen(&self.active) {
             Some(s) => s.clone(),
             None => return vec![],
@@ -131,7 +143,12 @@ impl Router {
                 vec![]
             };
         }
-        if let Some(next) = self.layout.at_global(gx, gy).cloned() {
+        let next = if allow_switch {
+            self.layout.at_global(gx, gy).cloned()
+        } else {
+            None
+        };
+        if let Some(next) = next {
             let (ex, ey) = (gx - next.x, gy - next.y);
             let out = vec![
                 Action::Leave { id: cur.id.clone() },
@@ -253,6 +270,25 @@ mod tests {
         assert_eq!(r.machine_lost("B"), vec![enter("A", 400, 300)]);
         assert!(r.is_local_active());
         assert_eq!(r.machine_lost("B"), vec![]);
+    }
+
+    #[test]
+    fn no_switch_while_dragging() {
+        let l = lay(vec![
+            Screen::new("A", 0, 0, 800, 600),
+            Screen::new("B", 800, 0, 800, 600),
+        ]);
+        let mut r = Router::new(l, "A").unwrap();
+        r.sync_local(799, 300);
+        assert_eq!(r.feed(5, 0, false), vec![]);
+        assert!(r.is_local_active());
+        assert_eq!(r.feed(5, 0, true), vec![leave("A"), enter("B", 4, 300)]);
+        // On the secondary, a drag stops at the edge too.
+        assert_eq!(
+            r.feed(-50, 0, false),
+            vec![Action::Forward { dx: -4, dy: 0 }]
+        );
+        assert_eq!(r.active(), "B");
     }
 
     #[test]

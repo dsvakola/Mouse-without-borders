@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod error;
 pub mod files;
 pub mod handshake;
+pub mod held;
 pub mod layout;
 pub mod limiter;
 pub mod protocol;

@@ -57,7 +57,8 @@ fn recv_hs<S: Read>(io: &mut S) -> Result<Hs> {
     decode(&read_frame(io)?)
 }
 
-/// Secondary side. `target_id` is the master's id (from discovery);
+/// Secondary side. `target_id` is the master's id (from discovery), or empty
+/// when connecting to a typed-in address whose id is not known yet;
 /// `secret` is the saved pairing secret for it, if any;
 /// `pin` is what the user typed, if anything.
 pub fn connect<S: Read + Write>(
@@ -80,7 +81,7 @@ pub fn connect<S: Read + Write>(
         Hs::ServerHello { id, name, method } => (PeerInfo { id, name }, method),
         _ => return Err(AppError::Protocol("unexpected reply".into())),
     };
-    if peer.id != target_id {
+    if !target_id.is_empty() && peer.id != target_id {
         return Err(AppError::Protocol(
             "connected to a different computer than expected".into(),
         ));
@@ -306,6 +307,24 @@ mod tests {
         let (s, c) = attempt(Some([1u8; 32]), "123456", Some([2u8; 32]), None);
         assert!(matches!(s, Err(AppError::PairingRejected)));
         assert!(matches!(c, Err(AppError::PairingRejected)));
+    }
+
+    #[test]
+    fn unknown_master_id_is_accepted_and_wrong_one_refused() {
+        let run = |target: &'static str| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let _ = accept(s, &master(), &|_| None, "123456");
+            });
+            let c = TcpStream::connect(addr).unwrap();
+            let r = connect(c, &laptop(), target, None, Some("123456"));
+            server.join().unwrap();
+            r
+        };
+        assert!(run("").is_ok());
+        assert!(matches!(run("someone-else"), Err(AppError::Protocol(_))));
     }
 
     #[test]

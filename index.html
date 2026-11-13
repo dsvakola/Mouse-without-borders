@@ -55,6 +55,11 @@
             <p class="hint indent">Files copied on one PC are saved in the Shared Files folder on the Desktop of the other PCs.</p>
           </fieldset>
           <fieldset>
+            <legend>Start-up</legend>
+            <div class="row"><label><input type="checkbox" id="opt-autostart" /> Start automatically when I sign in to Windows</label></div>
+            <p class="hint indent">It starts quietly in the notification area near the clock. Keep this on for every PC.</p>
+          </fieldset>
+          <fieldset>
             <legend>Keyboard shortcuts (on the master)</legend>
             <table class="keys">
               <tr><td>Ctrl + Alt + F1</td><td>Control this computer</td></tr>
@@ -72,6 +77,17 @@
               <input id="master-ip" type="text" inputmode="decimal" placeholder="e.g. 192.168.1.10" autocomplete="off" />
             </div>
             <p class="hint">Leave empty to find the master automatically. Fill it in only if automatic search does not work on your network. Changing it restarts the app.</p>
+          </fieldset>
+          <fieldset>
+            <legend>This computer</legend>
+            <div class="row">Address on the network: <strong id="my-address">…</strong></div>
+          </fieldset>
+          <fieldset>
+            <legend>Windows Firewall</legend>
+            <div class="row fw-row">
+              <button id="firewall">Allow through firewall</button>
+              <span class="hint" id="firewall-note">Use this once on each PC if the computers cannot find each other. Windows asks for administrator permission.</span>
+            </div>
           </fieldset>
         </section>
       </main>

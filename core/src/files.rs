@@ -2,6 +2,7 @@
 //! Names from the network are never trusted: paths are stripped, Windows-illegal
 //! characters replaced, and existing files are never overwritten.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -57,47 +58,52 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 struct Incoming {
-    id: u64,
     file: File,
     path: PathBuf,
     expected: u64,
     got: u64,
 }
 
+/// Receives files; several may arrive at once (each has its own id).
 pub struct FileReceiver {
     dir: PathBuf,
-    current: Option<Incoming>,
+    current: HashMap<u64, Incoming>,
 }
 
 impl FileReceiver {
     pub fn new(dir: PathBuf) -> Self {
-        FileReceiver { dir, current: None }
+        FileReceiver {
+            dir,
+            current: HashMap::new(),
+        }
     }
 
     pub fn begin(&mut self, id: u64, name: &str, size: u64) -> Result<()> {
-        self.abort();
+        self.abort(id);
         let safe = sanitize_file_name(name)?;
         fs::create_dir_all(&self.dir)?;
         let path = unique_path(&self.dir, &safe);
         let file = File::create(&path)?;
-        self.current = Some(Incoming {
+        self.current.insert(
             id,
-            file,
-            path,
-            expected: size,
-            got: 0,
-        });
+            Incoming {
+                file,
+                path,
+                expected: size,
+                got: 0,
+            },
+        );
         Ok(())
     }
 
     pub fn chunk(&mut self, id: u64, data: &[u8]) -> Result<()> {
-        let cur = match self.current.as_mut() {
-            Some(c) if c.id == id => c,
-            _ => return Err(AppError::Protocol("file data without an offer".into())),
-        };
+        let cur = self
+            .current
+            .get_mut(&id)
+            .ok_or_else(|| AppError::Protocol("file data without an offer".into()))?;
         cur.got += data.len() as u64;
         if cur.got > cur.expected {
-            self.abort();
+            self.abort(id);
             return Err(AppError::Protocol("file is larger than announced".into()));
         }
         cur.file.write_all(data)?;
@@ -106,8 +112,8 @@ impl FileReceiver {
 
     /// Returns the saved path.
     pub fn finish(&mut self, id: u64) -> Result<PathBuf> {
-        match self.current.take() {
-            Some(mut c) if c.id == id && c.got == c.expected => {
+        match self.current.remove(&id) {
+            Some(mut c) if c.got == c.expected => {
                 c.file.flush()?;
                 Ok(c.path)
             }
@@ -120,11 +126,21 @@ impl FileReceiver {
         }
     }
 
-    /// Drop a half-received file.
-    pub fn abort(&mut self) {
-        if let Some(c) = self.current.take() {
+    /// Drop one half-received file.
+    pub fn abort(&mut self, id: u64) {
+        if let Some(c) = self.current.remove(&id) {
             drop(c.file);
             let _ = fs::remove_file(&c.path);
+        }
+    }
+}
+
+impl Drop for FileReceiver {
+    /// Connection lost: never leave half-written files behind.
+    fn drop(&mut self) {
+        let ids: Vec<u64> = self.current.keys().copied().collect();
+        for id in ids {
+            self.abort(id);
         }
     }
 }
@@ -178,5 +194,24 @@ mod tests {
         assert!(r.chunk(2, b"abc").is_err()); // too big
         assert!(!dir.path().join("b.bin").exists());
         assert!(r.chunk(9, b"x").is_err()); // no offer
+    }
+
+    #[test]
+    fn two_files_at_once_and_cleanup_when_connection_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = FileReceiver::new(dir.path().to_path_buf());
+        r.begin(1, "one.txt", 4).unwrap();
+        r.begin(2, "two.txt", 4).unwrap();
+        r.chunk(1, b"11").unwrap();
+        r.chunk(2, b"2222").unwrap();
+        r.chunk(1, b"11").unwrap();
+        r.finish(2).unwrap();
+        r.finish(1).unwrap();
+        assert_eq!(fs::read(dir.path().join("one.txt")).unwrap(), b"1111");
+        assert_eq!(fs::read(dir.path().join("two.txt")).unwrap(), b"2222");
+        r.begin(3, "half.bin", 10).unwrap();
+        r.chunk(3, b"abc").unwrap();
+        drop(r);
+        assert!(!dir.path().join("half.bin").exists());
     }
 }

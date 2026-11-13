@@ -19,9 +19,14 @@ export interface AppState {
   shareClipboard: boolean;
   transferFiles: boolean;
   masterIp: string;
+  startWithWindows: boolean;
   machines: Machine[];
   connectedTo: string | null;
   engineError: string | null;
+  /** Something the user should fix. */
+  warning: string | null;
+  /** This PC's network addresses. */
+  addresses: string[];
   log: string[];
 }
 
@@ -36,6 +41,7 @@ export interface ApplyRequest {
   shareClipboard: boolean;
   transferFiles: boolean;
   masterIp: string;
+  startWithWindows: boolean;
   twoRow: boolean;
   cells: Cell[];
 }

@@ -21,6 +21,11 @@ export async function getAppInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("get_app_info");
 }
 
+/** Opens the Windows administrator prompt that adds the firewall permission. */
+export async function allowFirewall(): Promise<void> {
+  if (inTauri) await invoke("allow_firewall");
+}
+
 export async function hideWindow(): Promise<void> {
   if (inTauri) await invoke("hide_window");
 }

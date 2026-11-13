@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mwb_core::store::{self, Cell, Settings};
 use mwb_core::{AppError, SHARED_PIN};
@@ -13,6 +13,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, State, WindowEvent};
 
 const LOG_LINES: usize = 50;
+
+/// Lets a second start of the program ask the running copy to show its window.
+static APP: OnceLock<AppHandle> = OnceLock::new();
 
 enum Engine {
     #[cfg(windows)]
@@ -50,9 +53,14 @@ struct StateDto {
     share_clipboard: bool,
     transfer_files: bool,
     master_ip: String,
+    start_with_windows: bool,
     machines: Vec<MachineDto>,
     connected_to: Option<String>,
     engine_error: Option<String>,
+    /// Something the user should fix (shown in the status line).
+    warning: Option<String>,
+    /// This PC's network addresses (to type in on a secondary if ever needed).
+    addresses: Vec<String>,
     log: Vec<String>,
 }
 
@@ -71,6 +79,7 @@ struct ApplyRequest {
     share_clipboard: bool,
     transfer_files: bool,
     master_ip: String,
+    start_with_windows: bool,
     two_row: bool,
     cells: Vec<CellDto>,
 }
@@ -122,6 +131,7 @@ fn get_state(state: State<AppState>) -> StateDto {
     let mut machines = Vec::new();
     let mut connected_to = None;
     let mut engine_error = None;
+    let mut warning = None;
     match &*engine {
         #[cfg(windows)]
         Engine::Master(h) => {
@@ -137,11 +147,20 @@ fn get_state(state: State<AppState>) -> StateDto {
                     row: m.row,
                 })
                 .collect();
+            warning = h.warning();
         }
         #[cfg(windows)]
-        Engine::Secondary(h) => connected_to = h.connected_to(),
+        Engine::Secondary(h) => {
+            connected_to = h.connected_to();
+            warning = h.warning();
+        }
         Engine::Failed(e) => engine_error = Some(e.clone()),
     }
+    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into());
+    let addresses = mwb_core::discovery::local_ipv4s(&host)
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
     let log = state
         .log
         .lock()
@@ -159,9 +178,12 @@ fn get_state(state: State<AppState>) -> StateDto {
         share_clipboard: s.share_clipboard,
         transfer_files: s.transfer_files,
         master_ip: s.master_ip,
+        start_with_windows: s.start_with_windows,
         machines,
         connected_to,
         engine_error,
+        warning,
+        addresses,
         log,
     }
 }
@@ -176,18 +198,39 @@ fn apply_settings(
     if req.role != "master" && req.role != "secondary" {
         return Err(AppError::Store("unknown role".into()));
     }
+    let master_ip = req.master_ip.trim().to_string();
+    if !master_ip.is_empty() && master_ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(AppError::Io(format!(
+            "\"{master_ip}\" is not a valid address (example: 192.168.1.10)"
+        )));
+    }
     let mut s = state.settings.lock().unwrap();
-    let restart = s.role != req.role || s.master_ip.trim() != req.master_ip.trim();
+    let restart = s.role != req.role || s.master_ip != master_ip;
+    let autostart_changed = s.start_with_windows != req.start_with_windows;
     s.role = req.role;
-    s.master_ip = req.master_ip.trim().to_string();
+    s.master_ip = master_ip;
     s.share_clipboard = req.share_clipboard;
     s.transfer_files = req.transfer_files;
+    s.start_with_windows = req.start_with_windows;
     s.two_row = req.two_row;
+    // The running engine keeps its own copy of what it has learnt
+    // (pairings, arrangement, last master); read that back before saving.
+    if let Ok(Some(on_disk)) = store::load(&state.dir) {
+        s.peers = on_disk.peers;
+        s.cells = on_disk.cells;
+        s.last_master_addr = on_disk.last_master_addr;
+        s.last_master_id = on_disk.last_master_id;
+    }
     store::save(&state.dir, &s)?;
+    if autostart_changed {
+        set_autostart(s.start_with_windows)?;
+    }
     if restart {
         drop(s);
-        app.restart();
+        restart_app(&app);
+        return Ok(true);
     }
+    drop(s);
     let engine = state.engine.lock().unwrap();
     match &*engine {
         #[cfg(windows)]
@@ -209,6 +252,41 @@ fn apply_settings(
         Engine::Failed(_) => {}
     }
     Ok(false)
+}
+
+#[cfg(windows)]
+fn set_autostart(enable: bool) -> Result<(), AppError> {
+    mwb_core::platform::set_autostart(enable)
+}
+
+#[cfg(not(windows))]
+fn set_autostart(_: bool) -> Result<(), AppError> {
+    Ok(())
+}
+
+/// Start a fresh copy and close this one. The new copy waits until this one
+/// has gone, so the two never fight over the network ports.
+fn restart_app(app: &AppHandle) {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .arg(mwb_core::platform::ARG_RESTARTED)
+            .spawn();
+    }
+    app.exit(0);
+}
+
+/// Opens the Windows administrator prompt that adds the firewall permission.
+#[tauri::command]
+fn allow_firewall() -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        mwb_core::platform::request_firewall_rule()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(AppError::Io("Windows only".into()))
+    }
 }
 
 #[tauri::command]
@@ -240,9 +318,34 @@ fn show_main(app: &AppHandle) {
 }
 
 pub fn run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    let autostart = {
+        use mwb_core::platform::{self, ARG_AUTOSTART, ARG_FIREWALL, ARG_RESTARTED};
+        if args.iter().any(|a| a == ARG_FIREWALL) {
+            // Short-lived administrator copy: add the firewall rule and leave.
+            let _ = platform::add_firewall_rule();
+            return;
+        }
+        let autostart = args.iter().any(|a| a == ARG_AUTOSTART);
+        let restarted = args.iter().any(|a| a == ARG_RESTARTED);
+        let first = platform::single_instance(autostart, restarted, || {
+            if let Some(app) = APP.get() {
+                show_main(app);
+            }
+        });
+        if !first {
+            return; // already running: that copy now shows its window
+        }
+        autostart
+    };
+    #[cfg(not(windows))]
+    let autostart = args.iter().any(|a| a == "--autostart");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
+            let _ = APP.set(app.handle().clone());
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into());
             let settings = match store::load(&dir) {
@@ -254,7 +357,13 @@ pub fn run() {
                 }
             };
             let log = Arc::new(Mutex::new(VecDeque::new()));
+            // Keep the Windows start-up entry pointing at this copy of the program.
+            // (The installer switches it on; this follows the user's choice.)
+            let _ = set_autostart(settings.start_with_windows);
             let engine = start_engine(&dir, &settings, &log);
+            // Started by Windows at sign-in: stay quietly in the tray,
+            // unless something is wrong and the user must see it.
+            let show_now = !autostart || matches!(engine, Engine::Failed(_));
             app.manage(AppState {
                 dir,
                 settings: Mutex::new(settings),
@@ -287,7 +396,11 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
-            tray.build(app)?;
+            // If the tray icon cannot be made, the window is the only way in.
+            let tray_ok = tray.build(app).is_ok();
+            if show_now || !tray_ok {
+                show_main(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -301,7 +414,8 @@ pub fn run() {
             get_state,
             apply_settings,
             get_app_info,
-            hide_window
+            hide_window,
+            allow_firewall
         ])
         .run(tauri::generate_context!())
         .expect("error while running the application");

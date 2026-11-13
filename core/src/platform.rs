@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use windows::core::PWSTR;
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE,
+    HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::DataExchange::{
@@ -14,6 +15,16 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Power::{
+    SetThreadExecutionState, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+};
+use windows::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, SetEvent, SetThreadPriority, WaitForSingleObject, INFINITE,
+    THREAD_PRIORITY_TIME_CRITICAL,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -22,16 +33,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_MENU,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_MENU,
+    VK_RBUTTON,
 };
 use windows::Win32::UI::Shell::{
-    DragQueryFileW, FOLDERID_Desktop, SHGetKnownFolderPath, DROPFILES, HDROP, KF_FLAG_DEFAULT,
+    DragQueryFileW, FOLDERID_Desktop, SHGetKnownFolderPath, ShellExecuteW, DROPFILES, HDROP,
+    KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, SetCursorPos,
     SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED,
-    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
@@ -73,6 +86,29 @@ pub fn set_cursor_pos(x: i32, y: i32) {
 /// True while Ctrl and Alt are both held (used for the switch hotkeys).
 pub fn ctrl_alt_down() -> bool {
     unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 && GetAsyncKeyState(VK_MENU.0 as i32) < 0 }
+}
+
+/// True while a mouse button is physically held on this PC.
+pub fn mouse_button_down() -> bool {
+    unsafe {
+        [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+            .iter()
+            .any(|k| GetAsyncKeyState(k.0 as i32) < 0)
+    }
+}
+
+/// Tell Windows the PC is in use, so the screen does not switch off or lock
+/// while it is being controlled from another PC.
+pub fn keep_awake() {
+    unsafe {
+        SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    }
+}
+
+/// A mouse event that moves nothing: wakes a screen that has switched off.
+pub fn wake_screen() {
+    send(&[mouse(MOUSEEVENTF_MOVE, 0, 0, 0)]);
+    keep_awake();
 }
 
 fn send(inputs: &[INPUT]) {
@@ -420,6 +456,9 @@ pub fn start_capture(handler: impl Fn(Captured) -> bool + Send + Sync + 'static)
             SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hmod), 0);
         let k: std::result::Result<HHOOK, _> =
             SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), Some(hmod), 0);
+        // Windows silently removes hooks that answer slowly, so this thread
+        // must never wait behind other work.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         match (m, k) {
             (Ok(_), Ok(_)) => {
                 let _ = tx.send(Ok(()));
@@ -437,4 +476,132 @@ pub fn start_capture(handler: impl Fn(Captured) -> bool + Send + Sync + 'static)
     });
     rx.recv()
         .map_err(|_| AppError::Io("input hook thread stopped".into()))?
+}
+
+// ------------------------------------------------- start-up and permissions
+
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("MouseWithoutBorders");
+/// Command-line switch used when Windows starts the app at sign-in.
+pub const ARG_AUTOSTART: &str = "--autostart";
+/// Command-line switch: the app restarted itself (wait for the old copy to go).
+pub const ARG_RESTARTED: &str = "--restarted";
+/// Command-line switch: add the firewall rule (runs with administrator rights).
+pub const ARG_FIREWALL: &str = "--firewall";
+const FIREWALL_RULE: &str = "Mouse without borders";
+
+fn current_exe() -> Result<PathBuf> {
+    std::env::current_exe().map_err(|e| AppError::Io(format!("find the program file: {e}")))
+}
+
+/// Switch "start when I sign in to Windows" on or off (for this user only).
+/// The entry always points at the copy of the program that is running now.
+pub fn set_autostart(enable: bool) -> Result<()> {
+    unsafe {
+        let code = if enable {
+            let cmd = format!("\"{}\" {ARG_AUTOSTART}", current_exe()?.display());
+            let mut wide: Vec<u16> = cmd.encode_utf16().collect();
+            wide.push(0);
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                RUN_KEY,
+                RUN_VALUE,
+                REG_SZ.0,
+                Some(wide.as_ptr() as *const core::ffi::c_void),
+                (wide.len() * 2) as u32,
+            )
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
+        };
+        if code == ERROR_SUCCESS || (!enable && code == ERROR_FILE_NOT_FOUND) {
+            Ok(())
+        } else {
+            Err(AppError::Io(format!(
+                "could not change the Windows start-up entry (error {})",
+                code.0
+            )))
+        }
+    }
+}
+
+/// Ask Windows (with the usual administrator prompt) to let this program
+/// receive connections on every kind of network, including "Public" Wi-Fi.
+pub fn request_firewall_rule() -> Result<()> {
+    let exe = HSTRING::from(current_exe()?.as_os_str());
+    let args = HSTRING::from(ARG_FIREWALL);
+    let r = unsafe { ShellExecuteW(None, w!("runas"), &exe, &args, PCWSTR::null(), SW_HIDE) };
+    // ShellExecute reports success with a value above 32.
+    if r.0 as usize > 32 {
+        Ok(())
+    } else {
+        Err(AppError::Io(
+            "the firewall permission was not given (administrator prompt declined)".into(),
+        ))
+    }
+}
+
+/// Runs in the short-lived administrator copy started by `request_firewall_rule`.
+pub fn add_firewall_rule() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = current_exe()?;
+    // netsh reads its own command line, so the quotes are written exactly.
+    let netsh = |rest: String| {
+        std::process::Command::new("netsh")
+            .raw_arg(format!("advfirewall firewall {rest}"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+    };
+    // Remove an older rule of ours first (it may point at an older location).
+    let _ = netsh(format!("delete rule name=\"{FIREWALL_RULE}\""));
+    let ok = netsh(format!(
+        "add rule name=\"{FIREWALL_RULE}\" dir=in action=allow program=\"{}\" enable=yes profile=any",
+        exe.display()
+    ))
+    .map(|s| s.success())
+    .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Io("could not add the firewall rule".into()))
+    }
+}
+
+const INSTANCE_EVENT: PCWSTR = w!("Local\\VidyasagarAcademy.MouseWithoutBorders.Show");
+
+/// Make sure only one copy runs. Returns false if another copy is already
+/// running; that copy is then asked to show its window (unless `quiet`).
+/// In the first copy, `on_show` is called whenever a later copy asks.
+/// With `wait` (after a self-restart) the old copy is given time to close.
+pub fn single_instance(quiet: bool, wait: bool, on_show: impl Fn() + Send + 'static) -> bool {
+    unsafe {
+        let mut tries = if wait { 40 } else { 1 };
+        loop {
+            let Ok(h) = CreateEventW(None, false, false, INSTANCE_EVENT) else {
+                return true; // cannot tell: better to run than to refuse
+            };
+            let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+            if !exists {
+                let raw = h.0 as isize;
+                std::thread::spawn(move || {
+                    let h = HANDLE(raw as *mut core::ffi::c_void);
+                    while WaitForSingleObject(h, INFINITE) == WAIT_OBJECT_0 {
+                        on_show();
+                    }
+                });
+                return true;
+            }
+            tries -= 1;
+            if tries == 0 {
+                if !quiet && !wait {
+                    let _ = SetEvent(h);
+                }
+                let _ = CloseHandle(h);
+                // After a restart the old copy should be gone by now; run anyway.
+                return wait;
+            }
+            let _ = CloseHandle(h);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 }

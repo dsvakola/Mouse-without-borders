@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Largest frame accepted from the network (file chunks are far smaller).
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// File data is sent in chunks of this size.
-pub const FILE_CHUNK: usize = 256 * 1024;
+pub const FILE_CHUNK: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Button {
     Left,
     Right,
