@@ -80,6 +80,7 @@ Manual steps: `pnpm install`, then `pnpm tauri build`. Core tests: `cargo test -
 
 | Version | Notes |
 |---|---|
+| 0.2.1 | The cursor now enters the other PC at the facing edge (left edge when that PC is on the right, and so on for every placement), at the same relative height or width even when the screens differ in size; PCs of different sizes in the layout grid always reach each other across the whole edge. Works with 0.2.0 on the other PCs, but update all of them for the best result |
 | 0.2.0 | Reliability: starts with Windows (hidden in the tray), only one copy runs, PCs find each other through the firewall and on PCs with several network adapters, reconnect after restart or sleep, self-repairing pairing, no stuck keys or buttons, no switching in the middle of a drag, firewall button, clear messages when something is wrong |
 | 0.1.3 | Installer and uninstaller now use the application icon |
 | 0.1.2 | New application icon |

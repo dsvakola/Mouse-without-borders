@@ -86,6 +86,39 @@ impl Layout {
     pub fn at_global(&self, gx: i32, gy: i32) -> Option<&Screen> {
         self.screens.iter().find(|s| s.contains_global(gx, gy))
     }
+
+    /// The nearest screen beyond `cur`'s `side` edge that shares part of its
+    /// row (for left/right) or column (for top/bottom). Screens of different
+    /// sizes in the arrangement grid need not touch exactly: a shorter or
+    /// narrower neighbour is still reached across the whole edge.
+    pub fn neighbour(&self, cur: &Screen, side: Side) -> Option<&Screen> {
+        let rows = |s: &Screen| s.y < cur.y + cur.height && cur.y < s.y + s.height;
+        let cols = |s: &Screen| s.x < cur.x + cur.width && cur.x < s.x + s.width;
+        let others = self.screens.iter().filter(|s| s.id != cur.id);
+        match side {
+            Side::Right => others
+                .filter(|s| s.x >= cur.x + cur.width && rows(s))
+                .min_by_key(|s| (s.x, (s.y - cur.y).abs())),
+            Side::Left => others
+                .filter(|s| s.x + s.width <= cur.x && rows(s))
+                .max_by_key(|s| (s.x + s.width, -(s.y - cur.y).abs())),
+            Side::Bottom => others
+                .filter(|s| s.y >= cur.y + cur.height && cols(s))
+                .min_by_key(|s| (s.y, (s.x - cur.x).abs())),
+            Side::Top => others
+                .filter(|s| s.y + s.height <= cur.y && cols(s))
+                .max_by_key(|s| (s.y + s.height, -(s.x - cur.x).abs())),
+        }
+    }
+}
+
+/// An edge of a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
 }
 
 pub const GRID_COLS: usize = 3;

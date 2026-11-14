@@ -562,7 +562,11 @@ fn hook_handler(shared: Arc<MasterShared>, log: Log) -> impl Fn(Captured) -> boo
                         let acts = st.router.feed_delta(dx, dy);
                         st.apply(acts, &log);
                     }
-                    false
+                    // If this move just took the cursor to another PC, swallow it:
+                    // letting it through would put the real cursor back at the
+                    // edge after it was parked in the centre, and the next move
+                    // would then count as a jump of half a screen on the other PC.
+                    st.grabbed
                 } else {
                     let (dx, dy) = (x - st.center.0, y - st.center.1);
                     if dx != 0 || dy != 0 {

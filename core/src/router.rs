@@ -7,7 +7,45 @@
 //! the master swallows local input and forwards the movement instead.
 //! Call `sync_local` with the real cursor position whenever the master is active.
 
-use crate::layout::Layout;
+use crate::layout::{Layout, Screen, Side};
+
+/// Scale `v` (0..from) to the same fraction of 0..to.
+fn scale(v: i32, from: i32, to: i32) -> i32 {
+    if from <= 1 || to <= 1 {
+        return 0;
+    }
+    let v = v.clamp(0, from - 1) as i64;
+    ((v * (to - 1) as i64 + (from - 1) as i64 / 2) / (from - 1) as i64) as i32
+}
+
+/// Where the cursor appears on `next` after leaving `cur` through `side`,
+/// with (nx, ny) the position it would have had on `cur` (just past the edge).
+/// It enters at the facing edge of `next`, carrying on by however far it
+/// went past the edge, and the position along the edge keeps the same
+/// fraction of the screen (a third of the way down stays a third of the way
+/// down, whatever the two screen sizes).
+pub fn entry_point(cur: &Screen, next: &Screen, side: Side, nx: i32, ny: i32) -> (i32, i32) {
+    let last_x = next.width - 1;
+    let last_y = next.height - 1;
+    match side {
+        Side::Right => (
+            (nx - cur.width).clamp(0, last_x),
+            scale(ny, cur.height, next.height),
+        ),
+        Side::Left => (
+            (last_x + 1 + nx).clamp(0, last_x),
+            scale(ny, cur.height, next.height),
+        ),
+        Side::Bottom => (
+            scale(nx, cur.width, next.width),
+            (ny - cur.height).clamp(0, last_y),
+        ),
+        Side::Top => (
+            scale(nx, cur.width, next.width),
+            (last_y + 1 + ny).clamp(0, last_y),
+        ),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -131,10 +169,9 @@ impl Router {
             None => return vec![],
         };
         let (nx, ny) = (self.x + dx, self.y + dy);
-        let (gx, gy) = (cur.x + nx, cur.y + ny);
         let remote = !self.is_local_active();
 
-        if cur.contains_global(gx, gy) {
+        if nx >= 0 && nx < cur.width && ny >= 0 && ny < cur.height {
             self.x = nx;
             self.y = ny;
             return if remote {
@@ -143,25 +180,36 @@ impl Router {
                 vec![]
             };
         }
-        let next = if allow_switch {
-            self.layout.at_global(gx, gy).cloned()
-        } else {
-            None
-        };
-        if let Some(next) = next {
-            let (ex, ey) = (gx - next.x, gy - next.y);
-            let out = vec![
-                Action::Leave { id: cur.id.clone() },
-                Action::Enter {
-                    id: next.id.clone(),
-                    x: ex,
-                    y: ey,
-                },
-            ];
-            self.active = next.id;
-            self.x = ex;
-            self.y = ey;
-            return out;
+        if allow_switch {
+            // Horizontal edge first, then vertical (a diagonal move into a corner).
+            let mut sides = Vec::with_capacity(2);
+            if nx >= cur.width {
+                sides.push(Side::Right);
+            } else if nx < 0 {
+                sides.push(Side::Left);
+            }
+            if ny >= cur.height {
+                sides.push(Side::Bottom);
+            } else if ny < 0 {
+                sides.push(Side::Top);
+            }
+            for side in sides {
+                if let Some(next) = self.layout.neighbour(&cur, side).cloned() {
+                    let (ex, ey) = entry_point(&cur, &next, side, nx, ny);
+                    let out = vec![
+                        Action::Leave { id: cur.id.clone() },
+                        Action::Enter {
+                            id: next.id.clone(),
+                            x: ex,
+                            y: ey,
+                        },
+                    ];
+                    self.active = next.id;
+                    self.x = ex;
+                    self.y = ey;
+                    return out;
+                }
+            }
         }
         // Nothing beyond this edge: stop at the edge.
         let cx = nx.clamp(0, cur.width - 1);
@@ -204,36 +252,128 @@ mod tests {
             Screen::new("B", 1920, 0, 1366, 768),
         ]);
         let mut r = Router::new(l, "A").unwrap();
-        r.sync_local(1900, 500);
+        r.sync_local(1900, 540);
         assert_eq!(r.feed_delta(10, 0), vec![]);
-        r.sync_local(1919, 500);
-        assert_eq!(r.feed_delta(5, 0), vec![leave("A"), enter("B", 4, 500)]);
+        r.sync_local(1919, 540);
+        // Enters at B's left edge, half-way down stays half-way down.
+        assert_eq!(r.feed_delta(5, 0), vec![leave("A"), enter("B", 4, 384)]);
         assert_eq!(r.active(), "B");
         assert_eq!(
             r.feed_delta(30, -7),
             vec![Action::Forward { dx: 30, dy: -7 }]
         );
-        // Move back left across the shared edge.
-        r.jump_to("A");
-        r.sync_local(1919, 100);
-        r.feed_delta(1, 0);
-        assert_eq!(r.active(), "B");
-        assert_eq!(r.feed_delta(-3, 0), vec![leave("B"), enter("A", 1917, 100)]);
+        // Back left across the shared edge: lands at A's right edge.
+        assert_eq!(
+            r.feed_delta(-40, 0),
+            vec![leave("B"), enter("A", 1914, 530)]
+        );
         assert!(r.is_local_active());
     }
 
     #[test]
-    fn tall_neighbour_gap_clamps_instead_of_crossing() {
-        // B is shorter than A: the part of A's right edge below B has no neighbour.
+    fn shorter_neighbour_is_reached_along_the_whole_edge() {
+        // B is shorter than A: the bottom of A's right edge maps to B's bottom.
         let l = lay(vec![
             Screen::new("A", 0, 0, 1920, 1080),
             Screen::new("B", 1920, 0, 1366, 768),
         ]);
         let mut r = Router::new(l, "A").unwrap();
-        r.sync_local(1919, 900);
-        assert_eq!(r.feed_delta(50, 0), vec![]);
-        assert_eq!(r.active(), "A");
-        assert_eq!(r.position(), (1919, 900));
+        r.sync_local(1919, 1079);
+        assert_eq!(r.feed_delta(1, 0), vec![leave("A"), enter("B", 0, 767)]);
+    }
+
+    #[test]
+    fn enters_at_facing_edge_in_every_direction() {
+        // Master in the middle of a plus shape is impossible with three PCs,
+        // so check each direction with its own two-PC layout built from the grid.
+        use crate::layout::{layout_from_cells, Placed};
+        let pl = |id: &str, w, h, col, row| Placed {
+            id: id.into(),
+            width: w,
+            height: h,
+            col,
+            row,
+        };
+        // (B's cell, push dx, push dy, where B is entered).
+        type Case = (Vec<Placed>, (i32, i32), (i32, i32), (i32, i32));
+        let cases: Vec<Case> = vec![
+            // B to the right: leave A's right edge a quarter down.
+            (
+                vec![pl("A", 1920, 1080, 0, 0), pl("B", 1366, 768, 1, 0)],
+                (1919, 270),
+                (1, 0),
+                (0, 192),
+            ),
+            // B to the left.
+            (
+                vec![pl("B", 1366, 768, 0, 0), pl("A", 1920, 1080, 1, 0)],
+                (0, 270),
+                (-1, 0),
+                (1365, 192),
+            ),
+            // B below.
+            (
+                vec![pl("A", 1920, 1080, 0, 0), pl("B", 1366, 768, 0, 1)],
+                (480, 1079),
+                (0, 1),
+                (341, 0),
+            ),
+            // B above.
+            (
+                vec![pl("B", 1366, 768, 0, 0), pl("A", 1920, 1080, 0, 1)],
+                (480, 0),
+                (0, -1),
+                (341, 767),
+            ),
+        ];
+        for (cells, start, push, want) in cases {
+            let l = layout_from_cells(&cells).unwrap();
+            let mut r = Router::new(l, "A").unwrap();
+            r.sync_local(start.0, start.1);
+            assert_eq!(
+                r.feed_delta(push.0, push.1),
+                vec![leave("A"), enter("B", want.0, want.1)],
+                "B at cell ({}, {})",
+                cells.iter().find(|c| c.id == "B").unwrap().col,
+                cells.iter().find(|c| c.id == "B").unwrap().row
+            );
+            // And straight back: the cursor returns to the edge it left from.
+            let acts = r.feed_delta(-push.0 * 2, -push.1 * 2);
+            assert_eq!(acts.len(), 2);
+            assert!(r.is_local_active());
+            let (x, y) = r.position();
+            assert!((x - start.0).abs() <= 1 && (y - start.1).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn three_pcs_of_different_sizes_in_a_row_and_l_shape() {
+        use crate::layout::{layout_from_cells, Placed};
+        let pl = |id: &str, w, h, col, row| Placed {
+            id: id.into(),
+            width: w,
+            height: h,
+            col,
+            row,
+        };
+        // A narrow PC above a wide one, a third PC to the right of the narrow one:
+        // the grid column is as wide as the widest PC, so A and C do not touch,
+        // but A's right edge still leads to C, entering at C's left edge.
+        let l = layout_from_cells(&[
+            pl("A", 1366, 768, 0, 0),
+            pl("C", 1600, 900, 1, 0),
+            pl("B", 2560, 1440, 0, 1),
+        ])
+        .unwrap();
+        let mut r = Router::new(l, "A").unwrap();
+        r.sync_local(1365, 384);
+        assert_eq!(r.feed_delta(1, 0), vec![leave("A"), enter("C", 0, 450)]);
+        // Back to A, then down into the wide PC below it.
+        r.jump_to("A");
+        r.sync_local(683, 767);
+        assert_eq!(r.feed_delta(0, 1), vec![leave("A"), enter("B", 1280, 0)]);
+        // B's top edge leads back up into A.
+        assert_eq!(r.feed_delta(0, -2), vec![leave("B"), enter("A", 683, 766)]);
     }
 
     #[test]

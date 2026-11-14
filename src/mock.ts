@@ -46,7 +46,7 @@ export function mockApply(req: ApplyRequest): boolean {
 export function mockInfo(): AppInfo {
   return {
     name: "Mouse without borders",
-    version: "0.2.0",
+    version: "0.2.1",
     developers: "Prof. Dattaraj S. Vidyasagar & Prof. Yash D. Vidyasagar",
     organisation: "Vidyasagar Academy",
     website: "https://vsa.edu.in/software/",
